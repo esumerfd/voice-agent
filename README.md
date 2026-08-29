@@ -1,4 +1,4 @@
-# wk-voice-agent
+# Voice Agent
 
 An open-source, local-first, CPU-only voice agent that launches arbitrary
 workflows — each workflow is itself an agent performing a specific task.
