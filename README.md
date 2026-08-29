@@ -28,17 +28,15 @@ A workflow is a defined activity. Defaults to a workflow directory but configura
 
 ## Build
 
+Four independent crates, no shared workspace root — `make build` runs these in order:
+
 ```bash
-make build
-# or directly:
 make build
 ```
 
 ## Test
 
 ```bash
-make test
-# or directly:
 make test
 ```
 
