@@ -8,6 +8,27 @@ The current milestone delivers the CLI orchestrator core: list and run
 workflows by name. Voice capture (Whisper/Piper), the local LLM (Ollama),
 and the Claudette avatar are planned but not yet wired.
 
+## Install (Homebrew)
+
+```bash
+brew tap esumerfd/voice-agent https://github.com/esumerfd/voice-agent
+brew install esumerfd/voice-agent/orchestratord
+```
+
+Installs `orchestratord` (the daemon), `orchestrator` (the CLI), and
+`orchestrator-tui` on your `PATH`. There's no `brew services` integration
+yet, so start the daemon manually:
+
+```bash
+orchestratord
+```
+
+Then, in another terminal:
+
+```bash
+orchestrator list
+```
+
 ## Prerequisites
 
 - A stable Rust toolchain installed via [rustup](https://rustup.rs)
