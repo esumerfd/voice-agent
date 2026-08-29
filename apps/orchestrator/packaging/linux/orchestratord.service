@@ -1,0 +1,19 @@
+[Unit]
+Description=wk-voice-agent orchestrator daemon
+After=network.target
+
+[Service]
+ExecStart=__ORCHESTRATORD_BIN__ --port 47100
+Restart=on-failure
+WorkingDirectory=__WORKDIR__
+Environment=ORCHESTRATOR_CLAUDE_BIN=__CLAUDE_BIN__
+Environment=ANTHROPIC_API_KEY=__ANTHROPIC_API_KEY__
+# Redirected to the same path the macOS launchd plist uses for stderr, so
+# `orchestrator log`'s D-4 candidate list finds a file here too. Once
+# redirected, journald receives nothing for this unit -- `journalctl` is no
+# longer the answer on Linux; `orchestrator log` is.
+StandardOutput=append:/tmp/orchestratord.err.log
+StandardError=append:/tmp/orchestratord.err.log
+
+[Install]
+WantedBy=default.target

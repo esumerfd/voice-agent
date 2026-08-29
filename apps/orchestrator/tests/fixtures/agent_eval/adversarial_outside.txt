@@ -1,0 +1,4 @@
+This file lives outside the adversarial-path-traversal case's own workflow
+directory (tests/fixtures/agent_eval/cases/). If LocalRuntime::prepare ever
+stages this file into a run's scratch directory, the E-03 containment
+boundary has a hole.

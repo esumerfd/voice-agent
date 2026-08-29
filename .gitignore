@@ -1,0 +1,43 @@
+.obsidian/workspace.json
+.obsidian/workspace-mobile.json
+.obsidian/plugins/
+.smart-connections/
+.obsidian-git-data
+.trash/
+.DS_Store
+
+# Accidental duplicate of the companion Obsidian vault committed from a
+# stale git worktree (07-01 split audit) -- stripped from published
+# history; keep untracked going forward.
+.worktrees/
+
+# Rust
+apps/orchestrator/target/
+apps/orchestrator-cli/target/
+apps/orchestrator-tui/target/
+apps/shared/target/
+# workspace-default target dir, written by a bare `cargo build --workspace`
+# sanity check (see quick task 260712-nc9's verification) -- keep the tree
+# clean since this repo auto-commits dirty files.
+/target/
+
+# graphify cache (regenerable)
+spike/graphify-out/cache/
+docs/spike/graphify-out/cache/
+apps/.graphify-out/
+
+.planning/research/.cache
+
+# stray nested target/ build artifacts from a manifest-path cargo
+# invocation (07-01 split audit) -- regenerable, never intentionally
+# tracked
+apps/orchestrator-cli/apps/
+apps/orchestrator-tui/apps/
+
+# orchestratord's durable activity-history JSONL rotation store (D-12,
+# 05-05) -- runtime-generated at `--activity-dir`'s default of
+# ./data/activity, relative to whatever cwd orchestratord is launched from
+# (apps/orchestrator/ via `make run-daemon`, repo root via `make start`).
+# Never committed, matching the target/ auto-commit hygiene note above.
+apps/orchestrator/data/
+/data/

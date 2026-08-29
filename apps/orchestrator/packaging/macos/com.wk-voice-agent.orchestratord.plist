@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.wk-voice-agent.orchestratord</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>__ORCHESTRATORD_BIN__</string>
+		<string>--port</string>
+		<string>47100</string>
+	</array>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>ORCHESTRATOR_CLAUDE_BIN</key>
+		<string>__CLAUDE_BIN__</string>
+		<key>ANTHROPIC_API_KEY</key>
+		<string>__ANTHROPIC_API_KEY__</string>
+	</dict>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>WorkingDirectory</key>
+	<string>__WORKDIR__</string>
+	<key>StandardOutPath</key>
+	<string>/tmp/orchestratord.out.log</string>
+	<key>StandardErrorPath</key>
+	<string>/tmp/orchestratord.err.log</string>
+	<key>ProcessType</key>
+	<string>Standard</string>
+</dict>
+</plist>

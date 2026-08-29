@@ -1,0 +1,52 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+jobs:
+  release:
+    runs-on: macos-15-intel
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Derive tag
+        id: tag
+        run: echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Build orchestratord
+        run: cargo build --release --manifest-path apps/orchestrator/Cargo.toml
+
+      - name: Build orchestrator (CLI)
+        run: cargo build --release --manifest-path apps/orchestrator-cli/Cargo.toml
+
+      - name: Build orchestrator-tui
+        run: cargo build --release --manifest-path apps/orchestrator-tui/Cargo.toml
+
+      - name: Package release archive
+        id: package
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.tag.outputs.tag }}"
+          ASSET="voice-agent-${TAG}-x86_64-apple-darwin.tar.gz"
+          STAGE_DIR="$(mktemp -d)"
+          cp apps/orchestrator/target/release/orchestratord "$STAGE_DIR/"
+          cp apps/orchestrator-cli/target/release/orchestrator "$STAGE_DIR/"
+          cp apps/orchestrator-tui/target/release/orchestrator-tui "$STAGE_DIR/"
+          tar -czf "$ASSET" -C "$STAGE_DIR" orchestratord orchestrator orchestrator-tui
+          shasum -a 256 "$ASSET" > SHA256SUMS
+          echo "asset=${ASSET}" >> "$GITHUB_OUTPUT"
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "${{ steps.tag.outputs.tag }}" \
+            "${{ steps.package.outputs.asset }}" \
+            SHA256SUMS \
+            --generate-notes
