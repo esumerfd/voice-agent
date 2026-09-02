@@ -24,7 +24,18 @@ class Orchestratord < Formula
   # brew-installed service has no meaningful repo-checkout CWD to resolve
   # against in the first place. Each store is created lazily on first
   # write, so nothing needs pre-creating here.
+  #
+  # `service do` is instance_eval'd against a Homebrew::Service object, NOT
+  # this Formula instance (confirmed the hard way: calling a custom Formula
+  # method from here raised "undefined local variable or method" at
+  # `brew services start` time) -- only a fixed whitelist of formula path
+  # helpers (bin/var/opt_bin/etc) is available inside this block, so the
+  # XDG resolution must be inlined here with plain Ruby (ENV/Dir.home)
+  # rather than calling out to a Formula-defined method.
   service do
+    xdg_data_home = ENV["XDG_DATA_HOME"]
+    data_dir = "#{xdg_data_home.presence || "#{Dir.home}/.local/share"}/orchestratord"
+
     run [opt_bin/"orchestratord"]
     environment_variables ORCHESTRATOR_ACTIVITY_DIR:      "#{data_dir}/activity",
                           ORCHESTRATOR_AGENT_RUNS_DIR:    "#{data_dir}/agent-runs",
@@ -32,12 +43,6 @@ class Orchestratord < Formula
     keep_alive true
     log_path var/"log/orchestratord.log"
     error_log_path var/"log/orchestratord.log"
-  end
-
-  def data_dir
-    xdg_data_home = ENV["XDG_DATA_HOME"]
-    base = xdg_data_home.presence || "#{Dir.home}/.local/share"
-    "#{base}/orchestratord"
   end
 
   test do
