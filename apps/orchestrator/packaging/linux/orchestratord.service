@@ -8,6 +8,9 @@ Restart=on-failure
 WorkingDirectory=__WORKDIR__
 Environment=ORCHESTRATOR_CLAUDE_BIN=__CLAUDE_BIN__
 Environment=ANTHROPIC_API_KEY=__ANTHROPIC_API_KEY__
+Environment=ORCHESTRATOR_ACTIVITY_DIR=__DATA_DIR__/activity
+Environment=ORCHESTRATOR_AGENT_RUNS_DIR=__DATA_DIR__/agent-runs
+Environment=ORCHESTRATOR_AGENT_SCRATCH_DIR=__DATA_DIR__/agent-scratch
 # Redirected to the same path the macOS launchd plist uses for stderr, so
 # `orchestrator log`'s D-4 candidate list finds a file here too. Once
 # redirected, journald receives nothing for this unit -- `journalctl` is no

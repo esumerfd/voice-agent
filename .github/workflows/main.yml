@@ -1,0 +1,27 @@
+name: CI Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-and-test:
+    # Pure-Rust workspace with no macOS-specific code (only `#[cfg(unix)]`,
+    # which Linux satisfies too) -- ubuntu-latest is cheaper and faster than
+    # the macos-15-intel runner release.yml uses for packaging real darwin
+    # binaries, which isn't a concern here.
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      # Delegates to the root Makefile so CI exercises the exact same
+      # per-crate build/test ordering a contributor runs locally -- see the
+      # Makefile's own comment on why `shared` needs its own explicit
+      # `make test` invocation rather than relying on transitive builds.
+      - name: Build all apps
+        run: make build
+
+      - name: Test all apps
+        run: make test

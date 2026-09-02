@@ -16,8 +16,7 @@ brew install esumerfd/voice-agent/orchestratord
 ```
 
 Installs `orchestratord` (the daemon), `orchestrator` (the CLI), and
-`orchestrator-tui` on your `PATH`. There's no `brew services` integration
-yet, so start the daemon manually:
+`orchestrator-tui` on your `PATH`. Run it in the foreground:
 
 ```bash
 orchestratord
@@ -28,6 +27,18 @@ Then, in another terminal:
 ```bash
 orchestrator list
 ```
+
+Or run it in the background, managed by launchd (`brew services` registers
+it to start at login and restart if it crashes):
+
+```bash
+brew services start orchestratord
+```
+
+Either way, activity history, agent-run logs, and agent-scratch space are
+written under `$XDG_DATA_HOME/orchestratord` (falling back to
+`~/.local/share/orchestratord`), not the daemon's own `./data` default —
+see [Configuration](#configuration).
 
 ## Prerequisites
 
@@ -45,7 +56,7 @@ orchestrator list
 
 ## Workflows
 
-A workflow is a defined activity. Defaults to a workflow directory but configurable with ORCHESTRATOR_WORKFLOW_HOME
+A workflow is a defined activity. Defaults to a workflow directory but configurable with `ORCHESTRATOR_WORKFLOWS_DIR`
 
 - `workflows/` — declarative Markdown+YAML workflow definitions.
 
@@ -213,9 +224,18 @@ above — nothing here is CWD-relative; every path is explicit.
 | `ORCHESTRATOR_WORKFLOWS_DIR` | Directory scanned for workflow `.md` files. Also settable via the `--workflows-dir` flag. | `./workflows` |
 | `ORCHESTRATOR_CALENDAR_SCRIPT` | External script spawned by the `calendar_today` workflow. | `workflows/scripts/calendar_today.sh` |
 | `ORCHESTRATOR_CLAUDE_BIN` | Path to the `claude` binary the AI-agent handler spawns. Also settable via `--claude-bin`. | `claude` |
+| `ORCHESTRATOR_ACTIVITY_DIR` | Directory the durable activity-history JSONL rotation store is written into. Also settable via `--activity-dir`. | `./data/activity` |
 | `ORCHESTRATOR_AGENT_RUNS_DIR` | Directory the AI-agent handler's durable run log is written into. Also settable via `--agent-runs-dir`. | `./data/agent-runs` |
 | `ORCHESTRATOR_AGENT_SCRATCH_DIR` | Parent directory for the AI-agent handler's per-run scratch directories. Also settable via `--agent-scratch-dir`. | `./data/agent-scratch` |
 | `ANTHROPIC_API_KEY` | API key provisioned into the AI-agent handler's spawned `claude` process. Must be non-empty. | — (required for `agent.claude`) |
+
+These `./data`-relative defaults only apply when you run `orchestratord`
+yourself with no overrides. `brew services start orchestratord` and
+`make install` (launchd/systemd) both set `ORCHESTRATOR_ACTIVITY_DIR`,
+`ORCHESTRATOR_AGENT_RUNS_DIR`, and `ORCHESTRATOR_AGENT_SCRATCH_DIR`
+explicitly to `$XDG_DATA_HOME/orchestratord/*` (falling back to
+`~/.local/share/orchestratord/*`), so a background-managed daemon's data
+isn't tied to wherever it happened to be launched from.
 
 ## Where to look next
 

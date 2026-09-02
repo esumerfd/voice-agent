@@ -15,7 +15,29 @@ class Orchestratord < Formula
 
   def install
     bin.install "orchestratord", "orchestrator", "orchestrator-tui"
-    (var/"orchestratord").mkpath
+  end
+
+  # activity/agent-runs/agent-scratch land under XDG_DATA_HOME (falling
+  # back to ~/.local/share per the XDG Base Directory spec), matching the
+  # same convention `make install`'s launchd/systemd templates use --
+  # instead of the daemon's own CWD-relative ./data default, which a
+  # brew-installed service has no meaningful repo-checkout CWD to resolve
+  # against in the first place. Each store is created lazily on first
+  # write, so nothing needs pre-creating here.
+  service do
+    run [opt_bin/"orchestratord"]
+    environment_variables ORCHESTRATOR_ACTIVITY_DIR:      "#{data_dir}/activity",
+                          ORCHESTRATOR_AGENT_RUNS_DIR:    "#{data_dir}/agent-runs",
+                          ORCHESTRATOR_AGENT_SCRATCH_DIR: "#{data_dir}/agent-scratch"
+    keep_alive true
+    log_path var/"log/orchestratord.log"
+    error_log_path var/"log/orchestratord.log"
+  end
+
+  def data_dir
+    xdg_data_home = ENV["XDG_DATA_HOME"]
+    base = xdg_data_home.presence || "#{Dir.home}/.local/share"
+    "#{base}/orchestratord"
   end
 
   test do

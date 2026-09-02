@@ -16,6 +16,12 @@
 		<string>__CLAUDE_BIN__</string>
 		<key>ANTHROPIC_API_KEY</key>
 		<string>__ANTHROPIC_API_KEY__</string>
+		<key>ORCHESTRATOR_ACTIVITY_DIR</key>
+		<string>__DATA_DIR__/activity</string>
+		<key>ORCHESTRATOR_AGENT_RUNS_DIR</key>
+		<string>__DATA_DIR__/agent-runs</string>
+		<key>ORCHESTRATOR_AGENT_SCRATCH_DIR</key>
+		<string>__DATA_DIR__/agent-scratch</string>
 	</dict>
 	<key>RunAtLoad</key>
 	<true/>

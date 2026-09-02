@@ -3,6 +3,11 @@ PLIST_SRC   = apps/orchestrator/packaging/macos/com.wk-voice-agent.orchestratord
 PLIST_DEST  = $(HOME)/Library/LaunchAgents/com.wk-voice-agent.orchestratord.plist
 SYSTEMD_SRC  = apps/orchestrator/packaging/linux/orchestratord.service
 SYSTEMD_DEST = $(HOME)/.config/systemd/user/orchestratord.service
+# XDG_DATA_HOME (falls back to the spec's default, matching every other
+# XDG-aware tool) -- activity/agent-runs/agent-scratch land here instead of
+# the daemon's own CWD-relative ./data default, so an OS-managed instance's
+# data survives independently of wherever the repo checkout happens to live.
+DATA_DIR = $(if $(XDG_DATA_HOME),$(XDG_DATA_HOME),$(HOME)/.local/share)/orchestratord
 CLI_BIN_SRC  = apps/orchestrator-cli/target/debug/orchestrator
 CLI_BIN_DEST = $(HOME)/bin/orchestrator
 TUI_BIN_SRC  = apps/orchestrator-tui/target/debug/orchestrator-tui
@@ -37,6 +42,8 @@ help:
 	@echo "                manager (launchd LaunchAgent on macOS, systemd --user on Linux);"
 	@echo "                also builds and copies the orchestrator CLI and orchestrator-tui"
 	@echo "                to $(HOME)/bin (puts the CLI and TUI on PATH)"
+	@echo "                activity/agent-run/agent-scratch data is written to"
+	@echo "                $(DATA_DIR) (XDG_DATA_HOME), not the repo checkout"
 	@echo "  uninstall     unregister orchestratord from the OS service manager, remove"
 	@echo "                the installed service file, and remove $(HOME)/bin/orchestrator"
 	@echo "                and $(HOME)/bin/orchestrator-tui"
@@ -102,13 +109,13 @@ status:
 install: build-daemon
 	@OS=$$(uname -s); \
 	if [ "$$OS" = "Darwin" ]; then \
-		sed -e 's|__ORCHESTRATORD_BIN__|$(DAEMON_BIN_ABS)|' -e 's|__WORKDIR__|$(CURDIR)|' "$(PLIST_SRC)" > "$(PLIST_DEST)"; \
+		sed -e 's|__ORCHESTRATORD_BIN__|$(DAEMON_BIN_ABS)|' -e 's|__WORKDIR__|$(CURDIR)|' -e 's|__DATA_DIR__|$(DATA_DIR)|' "$(PLIST_SRC)" > "$(PLIST_DEST)"; \
 		launchctl load "$(PLIST_DEST)"; \
 		echo "orchestratord installed as a launchd LaunchAgent at $(PLIST_DEST)"; \
 		echo "check with: launchctl list | grep com.wk-voice-agent.orchestratord"; \
 	elif [ "$$OS" = "Linux" ]; then \
 		mkdir -p "$(HOME)/.config/systemd/user"; \
-		sed -e 's|__ORCHESTRATORD_BIN__|$(DAEMON_BIN_ABS)|' -e 's|__WORKDIR__|$(CURDIR)|' "$(SYSTEMD_SRC)" > "$(SYSTEMD_DEST)"; \
+		sed -e 's|__ORCHESTRATORD_BIN__|$(DAEMON_BIN_ABS)|' -e 's|__WORKDIR__|$(CURDIR)|' -e 's|__DATA_DIR__|$(DATA_DIR)|' "$(SYSTEMD_SRC)" > "$(SYSTEMD_DEST)"; \
 		systemctl --user daemon-reload && systemctl --user enable --now orchestratord.service; \
 		echo "orchestratord installed as a systemd --user service at $(SYSTEMD_DEST)"; \
 		echo "check with: systemctl --user status orchestratord.service"; \

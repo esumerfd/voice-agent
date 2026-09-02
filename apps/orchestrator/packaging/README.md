@@ -2,11 +2,11 @@
 
 This directory contains ready-to-install OS service definitions for
 `orchestratord`, the orchestrator daemon (D-05). Copy the file for your
-platform, edit the four placeholders, then register it with your OS service
+platform, edit the five placeholders, then register it with your OS service
 manager.
 
-**`make install` (repo root Makefile) only fills in `__ORCHESTRATORD_BIN__`
-and `__WORKDIR__`** — it does not touch `__CLAUDE_BIN__` or
+**`make install` (repo root Makefile) only fills in `__ORCHESTRATORD_BIN__`,
+`__WORKDIR__`, and `__DATA_DIR__`** — it does not touch `__CLAUDE_BIN__` or
 `__ANTHROPIC_API_KEY__`. If you want the AI-agent handler registered under
 an OS-managed `make install`, edit those two placeholders directly in the
 SOURCE file under this directory (`apps/orchestrator/packaging/macos/...
@@ -19,12 +19,21 @@ working normally, printing one `ERROR` line at boot noting that
 
 ## Placeholders you must edit
 
-Both service files use four placeholders — replace them before installing:
+Both service files use five placeholders — replace them before installing:
 
 - `__ORCHESTRATORD_BIN__` — absolute path to your built `orchestratord`
   binary (e.g. `/Users/you/wk-voice-agent/apps/orchestrator/target/debug/orchestratord`).
 - `__WORKDIR__` — absolute path to the directory whose `workflows/`
   subdirectory the daemon should scan (e.g. `/Users/you/wk-voice-agent`).
+- `__DATA_DIR__` — base directory for the daemon's activity history,
+  agent-run log, and agent-scratch space (`ORCHESTRATOR_ACTIVITY_DIR`/
+  `ORCHESTRATOR_AGENT_RUNS_DIR`/`ORCHESTRATOR_AGENT_SCRATCH_DIR`, each
+  suffixed `/activity`, `/agent-runs`, `/agent-scratch`). `make install`
+  fills this in as `$XDG_DATA_HOME/orchestratord` (falling back to
+  `~/.local/share/orchestratord` per the XDG Base Directory spec) instead
+  of the daemon's own CWD-relative `./data` default, so an OS-managed
+  instance's data survives independently of the repo checkout. No need to
+  exist ahead of time — each store is created lazily on first write.
 - `__CLAUDE_BIN__` — absolute path to the `claude` binary the AI-agent
   handler (`agent.claude`, 06-05) spawns. Resolve it with `which claude` on
   the machine that will run the service, and paste the absolute path it
