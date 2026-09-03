@@ -16,20 +16,60 @@ brew install esumerfd/voice-agent/orchestratord
 ```
 
 Installs `orchestratord` (the daemon), `orchestrator` (the CLI), and
-`orchestrator-tui` on your `PATH`. Run it in the foreground:
+`orchestrator-tui` on your `PATH`.
+
+### Set up a workflows directory (do this first)
+
+The Homebrew install ships only the three binaries — no workflow
+definitions. `orchestratord` scans `ORCHESTRATOR_WORKFLOWS_DIR` (default
+`./workflows`, resolved relative to wherever the daemon's current working
+directory happens to be) on startup, so with nothing pointing it anywhere
+real, `orchestrator list` comes back empty.
+
+**Running the daemon in the foreground:** `./workflows` resolves relative
+to whatever directory your shell is in. Point it somewhere real, then
+author your first workflow over the wire — no repo checkout needed:
+
+```bash
+export ORCHESTRATOR_WORKFLOWS_DIR=~/.config/orchestratord/workflows
+orchestratord
+```
+
+```bash
+# in another terminal
+orchestrator workflow create hello /path/to/hello.sh --param dur:int:required
+orchestrator list
+```
+
+`workflow create` creates `ORCHESTRATOR_WORKFLOWS_DIR` itself if it
+doesn't exist yet (see [Run — create a workflow](#run--create-a-workflow)
+below) — you don't need to `mkdir` it first.
+
+**Running via `brew services start orchestratord`:** this currently does
+**not** work for workflows out of the box. `brew services` runs the
+daemon with no working directory set, which launchd resolves to `/` — so
+`./workflows` resolves to `/workflows`, and both `orchestrator list` (empty)
+and `orchestrator workflow create` (`Read-only file system (os error 30)`)
+fail, since a normal user can't write to `/`. The Homebrew formula doesn't
+currently set `ORCHESTRATOR_WORKFLOWS_DIR` for the background service, so
+there's no supported override short of hand-editing the generated launchd
+plist. If you want a background-managed daemon with working workflows
+today, use `make install` from a source checkout instead (see
+[apps/orchestrator/packaging/README.md](apps/orchestrator/packaging/README.md))
+— its launchd/systemd templates set the working directory to the repo, so
+`./workflows` correctly resolves to the examples shipped there.
+
+### Start the daemon
+
+Foreground (see above for `ORCHESTRATOR_WORKFLOWS_DIR`):
 
 ```bash
 orchestratord
 ```
 
-Then, in another terminal:
-
-```bash
-orchestrator list
-```
-
-Or run it in the background, managed by launchd (`brew services` registers
-it to start at login and restart if it crashes):
+Or in the background, managed by launchd (`brew services` registers it to
+start at login and restart if it crashes — but see the workflows caveat
+above):
 
 ```bash
 brew services start orchestratord
@@ -40,12 +80,27 @@ written under `$XDG_DATA_HOME/orchestratord` (falling back to
 `~/.local/share/orchestratord`), not the daemon's own `./data` default —
 see [Configuration](#configuration).
 
+### Optional: AI-agent workflows
+
+If you plan to use `agent.claude`-type workflows (see [AI-agent
+workflows](#ai-agent-workflows) below), the daemon also needs
+`ANTHROPIC_API_KEY` set on its own environment, plus `ORCHESTRATOR_CLAUDE_BIN`
+pointed at an absolute path to the `claude` binary (`which claude`) —
+skip this if you don't need AI-agent workflows; every other workflow type
+works without it.
+
 ## Prerequisites
+
+**To build from source** (not needed for the Homebrew install above):
 
 - A stable Rust toolchain installed via [rustup](https://rustup.rs)
   (`cargo`, `rustc`) — Rust edition 2021. No specific version is pinned.
-- `bash` — required by the `calendar_today` and `countdown` workflows, both
-  of which spawn an external shell script.
+
+**At runtime, only if you use them:**
+
+- `bash` — required by the `calendar_today` and `countdown` example
+  workflows (shipped in this repo's `workflows/`, not in the Homebrew
+  install), both of which spawn an external shell script.
 
 ## Project layout
 
@@ -236,6 +291,11 @@ yourself with no overrides. `brew services start orchestratord` and
 explicitly to `$XDG_DATA_HOME/orchestratord/*` (falling back to
 `~/.local/share/orchestratord/*`), so a background-managed daemon's data
 isn't tied to wherever it happened to be launched from.
+
+**`ORCHESTRATOR_WORKFLOWS_DIR` is the one exception** — `brew services`
+does not set it (see [Set up a workflows directory](#set-up-a-workflows-directory-do-this-first)
+above), while `make install` does, since its templates point it at the
+repo checkout's own `workflows/`.
 
 ## Where to look next
 
