@@ -1,101 +1,30 @@
 name: Release
 
-# Deliberately manual (Recommended over release-per-push-to-main): the
-# current version to release lives in apps/orchestrator/Cargo.toml's
-# [package] version, read fresh each run -- never a workflow input -- so
-# "current version" always means exactly what's checked into main, with no
-# way for a dispatch input to drift from it.
+# Thin caller into esumerfd/actions' shared release.yml (workflow_call).
+# All the build/tag/release/bump logic that used to live here now lives
+# there, generalized to N products per repo -- see that repo's README for
+# the full contract. voice-agent exposes exactly ONE discoverable product,
+# "orchestrator": apps/orchestrator/Makefile is the only apps/*/Makefile
+# with a `release:` target (orchestrator-cli/orchestrator-tui deliberately
+# have none), because the three binaries ship as one bundle -- they speak
+# a WS protocol version tied to the daemon they were built alongside, so
+# releasing them independently would risk a client/daemon mismatch.
+#
+# `bump: patch` overrides the shared workflow's own default (minor) to
+# preserve this repo's existing convention.
+#
+# NOTE (tag naming changed): releases are now tagged `orchestrator-vX.Y.Z`
+# -- not the bare `vX.Y.Z` this repo used through v0.1.0. The Homebrew
+# Formula's `url` template was updated to match (see Formula/orchestratord.rb);
+# its `version`/`sha256` still need a real update once the first release
+# under this pipeline actually ships, same as any release.
 on:
   workflow_dispatch:
 
 jobs:
   release:
-    runs-on: macos-15-intel
     permissions:
       contents: write
-    steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-
-      # apps/orchestrator/Cargo.toml's version is the single source of
-      # truth for the release version (the four crates otherwise version
-      # independently -- "no shared workspace root" per the README). Fails
-      # fast with a clear error if that tag was already released, rather
-      # than letting `gh release create` fail later with a less obvious
-      # message.
-      - name: Read current version
-        id: version
-        run: |
-          set -euo pipefail
-          VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' apps/orchestrator/Cargo.toml | head -1)
-          if [ -z "$VERSION" ]; then
-            echo "::error::could not read [package] version from apps/orchestrator/Cargo.toml" >&2
-            exit 1
-          fi
-          TAG="v${VERSION}"
-          if git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null 2>&1; then
-            echo "::error::tag ${TAG} already exists on origin -- bump apps/orchestrator/Cargo.toml's version before re-running" >&2
-            exit 1
-          fi
-          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
-
-      - name: Build orchestratord
-        run: cargo build --release --manifest-path apps/orchestrator/Cargo.toml
-
-      - name: Build orchestrator (CLI)
-        run: cargo build --release --manifest-path apps/orchestrator-cli/Cargo.toml
-
-      - name: Build orchestrator-tui
-        run: cargo build --release --manifest-path apps/orchestrator-tui/Cargo.toml
-
-      - name: Package release archive
-        id: package
-        run: |
-          set -euo pipefail
-          TAG="${{ steps.version.outputs.tag }}"
-          ASSET="voice-agent-${TAG}-x86_64-apple-darwin.tar.gz"
-          STAGE_DIR="$(mktemp -d)"
-          cp apps/orchestrator/target/release/orchestratord "$STAGE_DIR/"
-          cp apps/orchestrator-cli/target/release/orchestrator "$STAGE_DIR/"
-          cp apps/orchestrator-tui/target/release/orchestrator-tui "$STAGE_DIR/"
-          tar -czf "$ASSET" -C "$STAGE_DIR" orchestratord orchestrator orchestrator-tui
-          shasum -a 256 "$ASSET" > SHA256SUMS
-          echo "asset=${ASSET}" >> "$GITHUB_OUTPUT"
-
-      # No tag exists yet (the trigger is workflow_dispatch, not a tag
-      # push) -- `gh release create` creates it pointing at the current
-      # commit as part of creating the release, i.e. at the commit whose
-      # Cargo.toml still says the CURRENT (pre-bump) version, which is
-      # exactly the code these binaries were built from.
-      - name: Publish release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          gh release create "${{ steps.version.outputs.tag }}" \
-            "${{ steps.package.outputs.asset }}" \
-            SHA256SUMS \
-            --generate-notes
-
-      # Bump apps/orchestrator/Cargo.toml (and its Cargo.lock self-entry)
-      # to the next patch version and commit straight to main, so the very
-      # next workflow_dispatch run reads a version that hasn't been
-      # released yet. Runs last, strictly after the release above
-      # succeeds -- a failed build/package/publish step leaves the version
-      # untouched and re-runnable as-is.
-      - name: Bump version for next release
-        run: |
-          set -euo pipefail
-          CURRENT="${{ steps.version.outputs.version }}"
-          IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
-          NEXT="${MAJOR}.${MINOR}.$((PATCH + 1))"
-
-          sed -i '' "s/^version = \"${CURRENT}\"/version = \"${NEXT}\"/" apps/orchestrator/Cargo.toml
-          cargo update --package orchestrator --manifest-path apps/orchestrator/Cargo.toml
-
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add apps/orchestrator/Cargo.toml apps/orchestrator/Cargo.lock
-          git commit -m "chore: bump orchestrator version to ${NEXT} after releasing v${CURRENT}"
-          git push origin HEAD:main
+    uses: esumerfd/actions/.github/workflows/release.yml@main
+    with:
+      bump: patch

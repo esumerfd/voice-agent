@@ -22,7 +22,7 @@ LAUNCHD_LABEL ?= com.wk-voice-agent.orchestratord
 SYSTEMD_UNIT ?= orchestratord.service
 PLIST_DEST = $(HOME)/Library/LaunchAgents/$(LAUNCHD_LABEL).plist
 
-.PHONY: test build run build-daemon start stop restart status tail
+.PHONY: test build run build-daemon start stop restart status tail release
 
 test:
 	cargo test -p orchestrator --target-dir target
@@ -135,3 +135,44 @@ status:
 	else \
 		echo "not running"; \
 	fi
+
+# Builds and packages a release archive containing all three binaries
+# (orchestratord, orchestrator, orchestrator-tui) together -- they ship as
+# one bundle because the CLI/TUI speak a WS protocol version tied to
+# whatever daemon they were built alongside; releasing them independently
+# risks a client/daemon version mismatch. This is the ONLY apps/*/Makefile
+# with a `release:` target: that's what makes esumerfd/actions' shared
+# release.yml discover exactly one releasable product ("orchestrator") for
+# this repo, not three (see .github/workflows/release.yml).
+#
+# TARGET is the Rust target triple to build for (e.g. aarch64-apple-darwin,
+# x86_64-apple-darwin) -- optional; omitted for a local run, which builds
+# for the host's own native target (detected via `rustc -vV`). The shared
+# workflow always passes it explicitly, one matrix leg per target.
+#
+# Version comes from this crate's own Cargo.toml: by the time this runs
+# (checked out at the release tag in CI, or on whatever's committed
+# locally) that manifest's version IS the version being packaged.
+ASSET_DIR := dist
+
+.PHONY: release
+release:
+	@set -e; \
+	VERSION=$$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1); \
+	if [ -z "$$VERSION" ]; then echo "release: could not read [package] version from Cargo.toml" >&2; exit 1; fi; \
+	TRIPLE="$(TARGET)"; \
+	if [ -z "$$TRIPLE" ]; then TRIPLE=$$(rustc -vV | sed -n 's/^host: //p'); fi; \
+	echo "release: building orchestratord/orchestrator/orchestrator-tui $$VERSION for $$TRIPLE"; \
+	cargo build --release --target "$$TRIPLE" --manifest-path Cargo.toml --target-dir target; \
+	cargo build --release --target "$$TRIPLE" --manifest-path ../orchestrator-cli/Cargo.toml --target-dir ../orchestrator-cli/target; \
+	cargo build --release --target "$$TRIPLE" --manifest-path ../orchestrator-tui/Cargo.toml --target-dir ../orchestrator-tui/target; \
+	STAGE_DIR=$$(mktemp -d); \
+	cp "target/$$TRIPLE/release/orchestratord" "$$STAGE_DIR/"; \
+	cp "../orchestrator-cli/target/$$TRIPLE/release/orchestrator" "$$STAGE_DIR/"; \
+	cp "../orchestrator-tui/target/$$TRIPLE/release/orchestrator-tui" "$$STAGE_DIR/"; \
+	rm -rf $(ASSET_DIR); mkdir -p $(ASSET_DIR); \
+	ASSET="voice-agent-v$${VERSION}-$${TRIPLE}.tar.gz"; \
+	tar -czf "$(ASSET_DIR)/$$ASSET" -C "$$STAGE_DIR" orchestratord orchestrator orchestrator-tui; \
+	shasum -a 256 "$(ASSET_DIR)/$$ASSET" | awk '{print $$1}' > "$(ASSET_DIR)/$$ASSET.sha256"; \
+	rm -rf "$$STAGE_DIR"; \
+	echo "release: wrote $(ASSET_DIR)/$$ASSET"

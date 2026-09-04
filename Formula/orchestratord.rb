@@ -6,9 +6,19 @@ class Orchestratord < Formula
 
   depends_on :macos
 
+  # Tag path is `orchestrator-v#{version}`, NOT a bare `v#{version}` --
+  # esumerfd/actions' shared release.yml tags per-product
+  # (`<product-name>-v<version>`), since a repo can release more than one
+  # independently-versioned product. voice-agent exposes exactly one
+  # ("orchestrator": apps/orchestrator/Makefile is its only `release:`
+  # target), but the tag still carries the product name. version/sha256
+  # below still point at the last release cut under the OLD bare-tag
+  # scheme (v0.0.1) -- both need a real update once the first release
+  # under the new pipeline actually ships; a fabricated checksum here
+  # would be worse than an honestly stale one.
   on_macos do
     on_intel do
-      url "https://github.com/esumerfd/voice-agent/releases/download/v0.0.1/voice-agent-v0.0.1-x86_64-apple-darwin.tar.gz"
+      url "https://github.com/esumerfd/voice-agent/releases/download/orchestrator-v#{version}/voice-agent-v#{version}-x86_64-apple-darwin.tar.gz"
       sha256 "1c6090e50e5d6c83c3177d0d255e93eabaa8c780700503a3775fa2ce235ef98e"
     end
   end
