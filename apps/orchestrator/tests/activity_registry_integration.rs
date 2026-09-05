@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
-use shared::ActivityStatus;
+use shared::{ActivityStatus, ProtocolFrame};
 use tempfile::TempDir;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::tungstenite::Message;
@@ -107,17 +107,27 @@ async fn hello(ws: &mut WsStream, client_name: &str) {
     .await;
 }
 
-/// Receives the next raw frame, with no filtering -- unlike
-/// `ws_server_integration.rs`'s `recv`, these tests deliberately want to
-/// observe `Envelope::Activity` frames, not skip them.
+/// Receives the next frame, skipping only the connection's own `Welcome`
+/// frame (Phase 8, D-01) -- unlike `ws_server_integration.rs`'s `recv`,
+/// these tests deliberately want to observe `Envelope::Activity` frames,
+/// not skip them, so `Welcome` is the sole frame kind filtered out here.
 async fn recv(ws: &mut WsStream) -> Envelope {
-    let msg = ws
-        .next()
-        .await
-        .expect("expected a frame before the stream ended")
-        .expect("expected a valid WS message");
-    let text = msg.to_text().expect("expected a text frame");
-    serde_json::from_str(text).expect("expected a valid Envelope")
+    loop {
+        let msg = ws
+            .next()
+            .await
+            .expect("expected a frame before the stream ended")
+            .expect("expected a valid WS message");
+        let text = msg.to_text().expect("expected a text frame");
+        let envelope: Envelope = serde_json::from_str(text).expect("expected a valid Envelope");
+        if matches!(
+            envelope,
+            Envelope::Protocol { frame: ProtocolFrame::Welcome { .. }, .. }
+        ) {
+            continue;
+        }
+        return envelope;
+    }
 }
 
 /// Receives frames until an `Envelope::Res` arrives, skipping any

@@ -58,6 +58,8 @@ mod tests {
                 agent: None,
             },
             source_path: std::path::PathBuf::from("stub.md"),
+            intent: String::new(),
+            triggers: Vec::new(),
         }
     }
 

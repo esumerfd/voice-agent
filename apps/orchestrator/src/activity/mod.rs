@@ -65,6 +65,7 @@ impl ActivityRegistry {
                     run_id: record.run_id.clone(),
                     workflow_id: record.workflow_id.clone(),
                     client_name: record.client_name.clone(),
+                    session_id: record.session_id.clone(),
                     status: ActivityStatus::NotStarted,
                     started_at_ms: record.at_ms,
                     log: Vec::new(),
@@ -87,13 +88,19 @@ impl ActivityRegistry {
     /// Mints a fresh run_id (D-02/D-05), creates its Invoked entry, and
     /// persists the transition. Two calls for the same `workflow_id`
     /// always produce two distinct activities, never collapsed.
-    pub fn mint_run_id(&self, workflow_id: &str, client_name: &str) -> String {
+    ///
+    /// `session_id` (Phase 8, D-01/D-02) is an additive parameter, never a
+    /// replacement for `client_name`: it records which connection started
+    /// this run, so two connections sharing the identical `client_name`
+    /// still produce activities attributable to different sessions.
+    pub fn mint_run_id(&self, workflow_id: &str, client_name: &str, session_id: &str) -> String {
         let run_id = self.minter.mint();
         let now = now_ms();
         let event = ActivityEvent {
             run_id: run_id.clone(),
             workflow_id: workflow_id.to_string(),
             client_name: client_name.to_string(),
+            session_id: session_id.to_string(),
             status: status_for_phase(ActivityPhase::Invoked),
             started_at_ms: now,
             log: vec![ActivityLogEvent {
@@ -107,6 +114,7 @@ impl ActivityRegistry {
             run_id: run_id.clone(),
             workflow_id: workflow_id.to_string(),
             client_name: client_name.to_string(),
+            session_id: session_id.to_string(),
             phase: ActivityPhase::Invoked,
             at_ms: now,
             detail: None,
@@ -135,17 +143,22 @@ impl ActivityRegistry {
                         at_ms: now,
                         detail: detail.clone(),
                     });
-                    Some((event.workflow_id.clone(), event.client_name.clone()))
+                    Some((
+                        event.workflow_id.clone(),
+                        event.client_name.clone(),
+                        event.session_id.clone(),
+                    ))
                 }
                 None => None,
             }
         };
 
-        if let Some((workflow_id, client_name)) = known {
+        if let Some((workflow_id, client_name, session_id)) = known {
             self.persist(ActivityRecord {
                 run_id: run_id.to_string(),
                 workflow_id,
                 client_name,
+                session_id,
                 phase,
                 at_ms: now,
                 detail,
@@ -245,6 +258,7 @@ mod tests {
             assert_eq!(a.run_id, b.run_id);
             assert_eq!(a.workflow_id, b.workflow_id);
             assert_eq!(a.client_name, b.client_name);
+            assert_eq!(a.session_id, b.session_id);
             assert_eq!(a.status, b.status);
             assert_eq!(a.log.len(), b.log.len(), "log length mismatch for {}", a.run_id);
             for (la, lb) in a.log.iter().zip(b.log.iter()) {
@@ -257,8 +271,8 @@ mod tests {
     #[test]
     fn distinct_activities_per_workflow_id() {
         let registry = ActivityRegistry::new();
-        let first = registry.mint_run_id("set_timer", "orchestrator-cli");
-        let second = registry.mint_run_id("set_timer", "orchestrator-cli");
+        let first = registry.mint_run_id("set_timer", "orchestrator-cli", "sess-1");
+        let second = registry.mint_run_id("set_timer", "orchestrator-cli", "sess-1");
         assert_ne!(first, second, "re-running the same workflow must mint two distinct run_ids");
 
         let snapshot = registry.snapshot_as_events();
@@ -272,7 +286,7 @@ mod tests {
     #[test]
     fn status_transition_mapping() {
         let registry = ActivityRegistry::new();
-        let run_id = registry.mint_run_id("set_timer", "orchestrator-cli");
+        let run_id = registry.mint_run_id("set_timer", "orchestrator-cli", "sess-1");
 
         registry.record_transition(&run_id, ActivityPhase::Running, None);
         assert_eq!(status_of(&registry, &run_id), Some(ActivityStatus::Running));
@@ -284,7 +298,7 @@ mod tests {
         );
         assert_eq!(status_of(&registry, &run_id), Some(ActivityStatus::Success));
 
-        let run_id_2 = registry.mint_run_id("set_timer", "orchestrator-cli");
+        let run_id_2 = registry.mint_run_id("set_timer", "orchestrator-cli", "sess-1");
         registry.record_transition(
             &run_id_2,
             ActivityPhase::Failed,
@@ -296,7 +310,7 @@ mod tests {
     #[test]
     fn get_returns_the_current_event_for_a_known_run_id_and_none_for_an_unknown_one() {
         let registry = ActivityRegistry::new();
-        let run_id = registry.mint_run_id("set_timer", "orchestrator-cli");
+        let run_id = registry.mint_run_id("set_timer", "orchestrator-cli", "sess-1");
 
         let event = registry.get(&run_id).expect("expected a known run_id to resolve to an event");
         assert_eq!(event.run_id, run_id);
@@ -313,7 +327,7 @@ mod tests {
     fn from_store_rebuild_reproduces_live_snapshot() {
         let dir = tempdir().expect("tempdir");
         let registry = ActivityRegistry::from_store(dir.path(), 7).expect("fresh from_store");
-        let run_id = registry.mint_run_id("set_timer", "orchestrator-cli");
+        let run_id = registry.mint_run_id("set_timer", "orchestrator-cli", "sess-1");
         registry.record_transition(&run_id, ActivityPhase::Running, None);
         registry.record_transition(
             &run_id,
@@ -327,5 +341,69 @@ mod tests {
         let rebuilt_events = events_of(&rebuilt);
 
         assert_events_match(&live, &rebuilt_events);
+    }
+
+    /// D-01/D-02: two runs sharing the identical `client_name` but minted
+    /// with different session ids must be attributable to different
+    /// sessions -- `client_name` is a display label only, `session_id` is
+    /// the real identity.
+    #[test]
+    fn mint_run_id_with_same_client_name_but_different_session_ids_produces_distinct_session_ids() {
+        let registry = ActivityRegistry::new();
+        let first = registry.mint_run_id("set_timer", "orchestrator-cli", "sess-1");
+        let second = registry.mint_run_id("set_timer", "orchestrator-cli", "sess-2");
+
+        let first_event = registry.get(&first).expect("first run must be known");
+        let second_event = registry.get(&second).expect("second run must be known");
+
+        assert_eq!(first_event.client_name, second_event.client_name);
+        assert_ne!(
+            first_event.session_id, second_event.session_id,
+            "identical client_name must not collapse distinct session ids"
+        );
+        assert_eq!(first_event.session_id, "sess-1");
+        assert_eq!(second_event.session_id, "sess-2");
+    }
+
+    /// T-08-04: a directory containing both a legacy record (no
+    /// `session_id` key) and a new record (with one) must rebuild both
+    /// activities with zero replay errors, the legacy one carrying an
+    /// empty session id.
+    #[test]
+    fn from_store_rebuilds_mixed_legacy_and_new_records_with_zero_replay_errors() {
+        let dir = tempdir().expect("tempdir");
+        let file_path = dir.path().join("activities-2020-01-01.jsonl");
+        let legacy_line = serde_json::json!({
+            "run_id": "run-0",
+            "workflow_id": "set_timer",
+            "client_name": "orchestrator-cli",
+            "phase": "completed",
+            "at_ms": 1_000,
+            "detail": null
+        });
+        let new_line = serde_json::json!({
+            "run_id": "run-1",
+            "workflow_id": "set_timer",
+            "client_name": "orchestrator-cli",
+            "session_id": "sess-1",
+            "phase": "completed",
+            "at_ms": 2_000,
+            "detail": null
+        });
+        std::fs::write(
+            &file_path,
+            format!("{}\n{}\n", legacy_line, new_line),
+        )
+        .expect("write mixed legacy/new fixture file");
+
+        let registry = ActivityRegistry::from_store(dir.path(), 3650).expect("from_store must rebuild without error");
+        let events = events_of(&registry);
+        assert_eq!(events.len(), 2, "both legacy and new records must rebuild into activities");
+
+        let legacy_event = events.iter().find(|e| e.run_id == "run-0").expect("legacy record must rebuild");
+        assert_eq!(legacy_event.session_id, "", "legacy record with no session_id key must rebuild with an empty session id");
+
+        let new_event = events.iter().find(|e| e.run_id == "run-1").expect("new record must rebuild");
+        assert_eq!(new_event.session_id, "sess-1");
     }
 }

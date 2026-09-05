@@ -16,7 +16,7 @@ use orchestrator::{
     activity::ActivityRegistry, CreateError, Envelope, InProcessOrchestrator, Registry,
     RequestPayload, ResponsePayload, Service,
 };
-use shared::{CreateWorkflowRequest, WorkflowWriteMode};
+use shared::{CreateWorkflowRequest, ProtocolFrame, WorkflowWriteMode};
 use tempfile::TempDir;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::tungstenite::Message;
@@ -33,6 +33,8 @@ fn base_request(id: &str) -> CreateWorkflowRequest {
         parameters: Vec::new(),
         mode: WorkflowWriteMode::Create,
     agent: None,
+    intent: None,
+    triggers: Vec::new(),
     }
 }
 
@@ -219,6 +221,11 @@ async fn send(ws: &mut WsStream, envelope: &Envelope) {
     ws.send(Message::text(text)).await.expect("failed to send frame");
 }
 
+/// Receives the next frame, transparently skipping any `Envelope::Activity`
+/// broadcast frame, and any `Envelope::Protocol(Welcome)` frame (Phase 8,
+/// D-01): every accepted connection now receives a server-minted session
+/// id as its first server-to-client frame, ahead of the activity replay
+/// burst.
 async fn recv(ws: &mut WsStream) -> Envelope {
     loop {
         let msg = ws
@@ -228,7 +235,12 @@ async fn recv(ws: &mut WsStream) -> Envelope {
             .expect("expected a valid WS message");
         let text = msg.to_text().expect("expected a text frame");
         let envelope: Envelope = serde_json::from_str(text).expect("expected a valid Envelope");
-        if matches!(envelope, Envelope::Activity { .. }) {
+        if matches!(envelope, Envelope::Activity { .. })
+            || matches!(
+                envelope,
+                Envelope::Protocol { frame: ProtocolFrame::Welcome { .. }, .. }
+            )
+        {
             continue;
         }
         return envelope;

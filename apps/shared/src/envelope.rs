@@ -16,6 +16,24 @@
 //! never correlates to a reply. `Activity { event }` is a server-push-only
 //! frame (D-01/D-03) broadcasting/replaying an `ActivityEvent` snapshot; a
 //! client must never send one.
+//!
+//! Phase 8 extends this envelope again with a connection-identity and
+//! run-recovery frame family (D-01, D-02, D-05): `ProtocolFrame` is a NEW,
+//! separately internally-tagged sub-enum carried by the single additive
+//! `Envelope::Protocol { id, frame }` variant, rather than being folded
+//! into the existing `#[serde(untagged)]` `RequestPayload`/`ResponsePayload`
+//! enums below -- their documented variant-ordering contracts (D-DISC-03,
+//! quick task 260812-qp4 D-7) are left byte-for-byte untouched by this or
+//! any future protocol-frame addition (D-05). `ProtocolFrame::Welcome`
+//! carries the daemon-minted session id sent as every connection's very
+//! first server-to-client frame (D-01) -- session identity is minted
+//! exclusively server-side and is never derived from anything the client
+//! sends; `client_name` on `Hello` remains a plain, self-reported display
+//! label only, never promoted into a reconnect/ownership key (D-02).
+//! `ProtocolFrame::DescribeRun`/`RunDescription` let a client that lost its
+//! connection mid-run recover that run's current state by `run_id` -- the
+//! identifier it already holds from the original `Started` ack -- never by
+//! connection/session identity.
 
 use serde::{Deserialize, Serialize};
 
@@ -58,6 +76,49 @@ pub enum Envelope {
     /// transition thereafter. Server-push-only: a client must never send
     /// this frame.
     Activity { event: ActivityEvent },
+    /// Phase 8 (D-01/D-02/D-05): the single additive carrier for every new
+    /// protocol frame added by this phase and beyond. `frame` is defined on
+    /// the separately-tagged `ProtocolFrame` sub-enum specifically so a new
+    /// frame never has to be squeezed into the order-sensitive untagged
+    /// `RequestPayload`/`ResponsePayload` enums above (D-05). `id`
+    /// correlates a client's `DescribeRun` to its `RunDescription` reply
+    /// the same way `Req`/`Res` correlate by `id`; a server-pushed `Welcome`
+    /// ignores `id` (sent as `0`) since it never replies to a request.
+    Protocol { id: u64, frame: ProtocolFrame },
+}
+
+/// Phase 8's new connection-identity and run-recovery frame family (D-01,
+/// D-02, D-05). Internally tagged on `kind` (distinct from `Envelope`'s own
+/// `type` tag) so the JSON literal is
+/// `{"type":"protocol","id":N,"frame":{"kind":"welcome"|"describe_run"|
+/// "run_description", ...}}` — a NEW sub-enum, never a variant folded into
+/// `RequestPayload`/`ResponsePayload`'s `#[serde(untagged)]` resolution
+/// order, so that order is never put at risk by a future frame addition.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ProtocolFrame {
+    /// Server-push-only (D-01): the daemon's freshly-minted, per-connection
+    /// session id, sent as the very first server-to-client frame on every
+    /// connection — before any activity replay burst frame. Never derived
+    /// from, or accepted from, any client-supplied value (a client-sent
+    /// `session_id` key on `Hello`, if ever added, must never be read into
+    /// this value — D-01's spoofing prohibition).
+    Welcome { session_id: String },
+    /// Client-to-daemon only: recovers a run's current state by `run_id` —
+    /// the identifier the client already holds from the original `Started`
+    /// ack — never by connection/session identity (D-01).
+    DescribeRun { run_id: String },
+    /// The daemon's reply to `DescribeRun`: `found: false` (with
+    /// `event: None`) for a `run_id` the registry has never seen is a
+    /// normal reply, never a `ServerError` and never a dropped connection.
+    /// `found: true` carries the run's current `ActivityEvent` snapshot,
+    /// sourced from the existing read-only `ActivityRegistry::get` lookup —
+    /// answering `DescribeRun` never mutates registry state.
+    RunDescription {
+        run_id: String,
+        found: bool,
+        event: Option<ActivityEvent>,
+    },
 }
 
 /// The payload of an `Envelope::Req`. `#[serde(untagged)]` wraps the
@@ -314,6 +375,8 @@ mod tests {
                 parameters: Vec::new(),
                 mode: WorkflowWriteMode::Create,
                 agent: None,
+                intent: None,
+                triggers: Vec::new(),
             }),
         };
         assert_round_trips(&envelope);
@@ -335,6 +398,8 @@ mod tests {
                 }],
                 mode: WorkflowWriteMode::Create,
                 agent: None,
+                intent: None,
+                triggers: Vec::new(),
             }),
         };
         assert_round_trips(&envelope);
@@ -352,6 +417,8 @@ mod tests {
                 parameters: Vec::new(),
                 mode: WorkflowWriteMode::Edit,
                 agent: None,
+                intent: None,
+                triggers: Vec::new(),
             }),
         };
         assert_round_trips(&envelope);
@@ -724,6 +791,7 @@ mod tests {
             run_id: "run-1".to_string(),
             workflow_id: "set_timer".to_string(),
             client_name: "orchestrator-tui".to_string(),
+            session_id: "sess-1".to_string(),
             status: crate::activity::ActivityStatus::Running,
             started_at_ms: 1_000,
             log: vec![crate::activity::ActivityLogEvent {
@@ -793,5 +861,119 @@ mod tests {
             serde_json::from_str(&json_string).expect("from_str");
         let after = serde_json::to_value(&parsed).expect("serialize after round-trip");
         assert_eq!(before, after, "round-trip changed the JSON value");
+    }
+
+    // ---- Phase 8 (D-01/D-02/D-05): ProtocolFrame / Envelope::Protocol ----
+
+    #[test]
+    fn protocol_welcome_round_trips_and_carries_the_literal_tags() {
+        let envelope = Envelope::Protocol {
+            id: 0,
+            frame: ProtocolFrame::Welcome {
+                session_id: "sess-0".to_string(),
+            },
+        };
+        assert_round_trips(&envelope);
+
+        let value = serde_json::to_value(&envelope).expect("serialize");
+        assert_eq!(value["type"], json!("protocol"), "expected type == \"protocol\", got: {value}");
+        assert_eq!(
+            value["frame"]["kind"],
+            json!("welcome"),
+            "expected frame.kind == \"welcome\", got: {value}"
+        );
+        assert_eq!(
+            value["frame"]["session_id"],
+            json!("sess-0"),
+            "expected the wrapped session_id to survive, got: {value}"
+        );
+    }
+
+    #[test]
+    fn protocol_describe_run_round_trips_and_carries_the_literal_tags() {
+        let envelope = Envelope::Protocol {
+            id: 1,
+            frame: ProtocolFrame::DescribeRun {
+                run_id: "run-0".to_string(),
+            },
+        };
+        assert_round_trips(&envelope);
+
+        let value = serde_json::to_value(&envelope).expect("serialize");
+        assert_eq!(value["type"], json!("protocol"), "expected type == \"protocol\", got: {value}");
+        assert_eq!(
+            value["frame"]["kind"],
+            json!("describe_run"),
+            "expected frame.kind == \"describe_run\", got: {value}"
+        );
+        assert_eq!(
+            value["frame"]["run_id"],
+            json!("run-0"),
+            "expected the wrapped run_id to survive, got: {value}"
+        );
+    }
+
+    #[test]
+    fn protocol_run_description_round_trips_and_carries_the_literal_tags() {
+        let envelope = Envelope::Protocol {
+            id: 1,
+            frame: ProtocolFrame::RunDescription {
+                run_id: "run-0".to_string(),
+                found: true,
+                event: Some(sample_activity_event()),
+            },
+        };
+        assert_round_trips(&envelope);
+
+        let value = serde_json::to_value(&envelope).expect("serialize");
+        assert_eq!(value["type"], json!("protocol"), "expected type == \"protocol\", got: {value}");
+        assert_eq!(
+            value["frame"]["kind"],
+            json!("run_description"),
+            "expected frame.kind == \"run_description\", got: {value}"
+        );
+        assert_eq!(value["frame"]["found"], json!(true), "expected found == true, got: {value}");
+        assert_eq!(
+            value["frame"]["event"]["run_id"],
+            json!("run-1"),
+            "expected the wrapped ActivityEvent to survive, got: {value}"
+        );
+    }
+
+    #[test]
+    fn protocol_run_description_with_no_event_round_trips() {
+        let envelope = Envelope::Protocol {
+            id: 2,
+            frame: ProtocolFrame::RunDescription {
+                run_id: "run-does-not-exist".to_string(),
+                found: false,
+                event: None,
+            },
+        };
+        assert_round_trips(&envelope);
+
+        let value = serde_json::to_value(&envelope).expect("serialize");
+        assert_eq!(value["frame"]["found"], json!(false), "expected found == false, got: {value}");
+        assert!(value["frame"]["event"].is_null(), "expected event to be null, got: {value}");
+    }
+
+    /// D-05 ordering guard: the new `Envelope::Protocol` variant must never
+    /// disturb `RequestPayload`'s existing untagged variant resolution --
+    /// an empty `{}` payload still resolves to `ListWorkflows`.
+    #[test]
+    fn protocol_variant_addition_does_not_disturb_untagged_request_payload_resolution() {
+        let raw = json!({"type": "req", "id": 1, "payload": {}});
+        let envelope: Envelope =
+            serde_json::from_value(raw).expect("empty payload object should still deserialize");
+
+        match envelope {
+            Envelope::Req {
+                payload: RequestPayload::ListWorkflows(_),
+                ..
+            } => {}
+            other => panic!(
+                "expected an empty `{{}}` payload to still resolve to RequestPayload::ListWorkflows after the Protocol variant was added, got: {other:?}"
+            ),
+        }
     }
 }

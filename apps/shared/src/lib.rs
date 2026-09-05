@@ -16,4 +16,4 @@ pub use client::{
     OrchestratorClient, ParameterDescriptor, ParameterType, WorkflowCreator, WorkflowDeleter,
     WorkflowSummary, WorkflowWriteMode,
 };
-pub use envelope::{Envelope, RequestPayload, ResponsePayload, DEFAULT_PORT};
+pub use envelope::{Envelope, ProtocolFrame, RequestPayload, ResponsePayload, DEFAULT_PORT};

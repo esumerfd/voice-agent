@@ -15,6 +15,7 @@ fn sample_record(run_id: &str, phase: ActivityPhase, at_ms: u64) -> ActivityReco
         run_id: run_id.to_string(),
         workflow_id: "set_timer".to_string(),
         client_name: "orchestrator-tui".to_string(),
+        session_id: "sess-1".to_string(),
         phase,
         at_ms,
         detail: None,

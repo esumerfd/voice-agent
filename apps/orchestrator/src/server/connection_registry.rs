@@ -31,6 +31,7 @@ type EventTx = mpsc::UnboundedSender<Envelope>;
 
 struct ConnEntry {
     client_name: String,
+    session_id: String,
     tx: EventTx,
 }
 
@@ -55,9 +56,17 @@ pub fn next_conn_id() -> ConnId {
 
 impl ConnectionRegistry {
     /// Registers `id` with its self-reported `client_name` (from Hello,
-    /// D-03/D-04) and the sender half of its per-connection mpsc channel.
-    pub async fn register(&self, id: ConnId, client_name: String, tx: EventTx) {
-        self.inner.lock().await.insert(id, ConnEntry { client_name, tx });
+    /// D-03/D-04), its server-minted `session_id` (D-01/D-02), and the
+    /// sender half of its per-connection mpsc channel.
+    pub async fn register(&self, id: ConnId, client_name: String, session_id: String, tx: EventTx) {
+        self.inner.lock().await.insert(
+            id,
+            ConnEntry {
+                client_name,
+                session_id,
+                tx,
+            },
+        );
     }
 
     /// Removes `id`'s entry. Must run unconditionally on every
@@ -81,6 +90,15 @@ impl ConnectionRegistry {
     #[allow(dead_code)] // available for a future "which client ran this" lookup; unused by 05-04 itself
     pub async fn client_name(&self, id: ConnId) -> Option<String> {
         self.inner.lock().await.get(&id).map(|entry| entry.client_name.clone())
+    }
+
+    /// Looks up the session id recorded for `id`, if it is still
+    /// registered (D-02): this, not `client_name`, is the connection's
+    /// identity -- `client_name` remains a plain, self-reported display
+    /// label that is never used for reconnect or ownership logic.
+    #[allow(dead_code)] // available for a future per-connection session lookup; unused by 08-01 itself
+    pub async fn session_id(&self, id: ConnId) -> Option<String> {
+        self.inner.lock().await.get(&id).map(|entry| entry.session_id.clone())
     }
 
     /// Fans `env` out to every registered connection. Never blocks on, and
@@ -110,7 +128,7 @@ mod tests {
     async fn register_then_broadcast_delivers_to_that_connection() {
         let registry = ConnectionRegistry::default();
         let (tx, mut rx) = mpsc::unbounded_channel();
-        registry.register(1, "test-client".to_string(), tx).await;
+        registry.register(1, "test-client".to_string(), "sess-0".to_string(), tx).await;
 
         registry.broadcast(&hello("orchestrator-cli")).await;
 
@@ -127,8 +145,8 @@ mod tests {
         let registry = ConnectionRegistry::default();
         let (tx1, mut rx1) = mpsc::unbounded_channel();
         let (tx2, mut rx2) = mpsc::unbounded_channel();
-        registry.register(1, "a".to_string(), tx1).await;
-        registry.register(2, "b".to_string(), tx2).await;
+        registry.register(1, "a".to_string(), "sess-0".to_string(), tx1).await;
+        registry.register(2, "b".to_string(), "sess-1".to_string(), tx2).await;
 
         registry.broadcast(&hello("orchestrator-tui")).await;
 
@@ -141,8 +159,8 @@ mod tests {
         let registry = ConnectionRegistry::default();
         let (tx1, rx1) = mpsc::unbounded_channel();
         let (tx2, mut rx2) = mpsc::unbounded_channel();
-        registry.register(1, "dead".to_string(), tx1).await;
-        registry.register(2, "alive".to_string(), tx2).await;
+        registry.register(1, "dead".to_string(), "sess-0".to_string(), tx1).await;
+        registry.register(2, "alive".to_string(), "sess-1".to_string(), tx2).await;
         drop(rx1); // simulate a disconnected client whose receiver is gone
 
         // Must not panic, and must still reach the surviving connection.
@@ -158,7 +176,7 @@ mod tests {
     async fn deregister_removes_the_entry_so_broadcast_no_longer_targets_it() {
         let registry = ConnectionRegistry::default();
         let (tx, mut rx) = mpsc::unbounded_channel();
-        registry.register(1, "test-client".to_string(), tx).await;
+        registry.register(1, "test-client".to_string(), "sess-0".to_string(), tx).await;
         registry.deregister(1).await;
 
         registry.broadcast(&hello("orchestrator-cli")).await;
@@ -174,5 +192,29 @@ mod tests {
         let first = next_conn_id();
         let second = next_conn_id();
         assert!(second > first, "expected next_conn_id to strictly increase");
+    }
+
+    /// D-02 regression guard: two connections that self-report the
+    /// identical `client_name` must still occupy separate registry entries
+    /// with distinct session ids -- `client_name` is a display label only,
+    /// never an identity/dedup key.
+    #[tokio::test]
+    async fn two_registrations_sharing_the_identical_client_name_carry_distinct_session_ids() {
+        let registry = ConnectionRegistry::default();
+        let (tx1, _rx1) = mpsc::unbounded_channel();
+        let (tx2, _rx2) = mpsc::unbounded_channel();
+        registry
+            .register(1, "orchestrator-cli".to_string(), "sess-0".to_string(), tx1)
+            .await;
+        registry
+            .register(2, "orchestrator-cli".to_string(), "sess-1".to_string(), tx2)
+            .await;
+
+        let session_1 = registry.session_id(1).await.expect("expected connection 1 to be registered");
+        let session_2 = registry.session_id(2).await.expect("expected connection 2 to be registered");
+        assert_ne!(
+            session_1, session_2,
+            "expected distinct session ids for two connections sharing the same client_name"
+        );
     }
 }

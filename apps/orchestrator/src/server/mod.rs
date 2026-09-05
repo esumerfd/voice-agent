@@ -39,6 +39,21 @@
 //! (D-01), and `handle_connection` replays the registry's current snapshot
 //! to a newly-connecting client immediately after Hello, BEFORE that
 //! connection is registered for live broadcast (RESEARCH Pattern 2).
+//!
+//! Phase 8 (plan 08-01, D-01/D-02/D-05) gives the connection a real
+//! identity and adds a run-recovery path: immediately after `read_hello`
+//! returns, `handle_connection` mints a fresh session id
+//! (`session_id::next_session_id`, D-01) and sends it back on a
+//! `ProtocolFrame::Welcome` frame -- provably the FIRST server-to-client
+//! frame on the connection, sent before the activity replay burst. This
+//! session id, not `client_name`, becomes the connection's identity (D-02)
+//! and is stored on `ConnEntry`. `ProtocolFrame::DescribeRun` routes
+//! straight to the already-existing, read-only `ActivityRegistry::get`
+//! (never a re-implemented lookup) so a client that reconnects after
+//! dropping mid-run can recover that run's current state and terminal
+//! result by `run_id` alone.
+
+mod session_id;
 
 mod connection_registry;
 
@@ -52,7 +67,7 @@ use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 
-use connection_registry::ConnectionRegistry;
+use connection_registry::{ConnId, ConnectionRegistry};
 
 use crate::activity::ActivityRegistry;
 use crate::client::InProcessOrchestrator;
@@ -60,7 +75,7 @@ use crate::definition::ServiceMode;
 use crate::error::ServerError;
 use shared::{
     ActivityPhase, Envelope, InvokeStatus, InvokeWorkflowResponse, OrchestratorClient,
-    RequestPayload, ResponsePayload, WorkflowCreator, WorkflowDeleter,
+    ProtocolFrame, RequestPayload, ResponsePayload, WorkflowCreator, WorkflowDeleter,
 };
 
 /// The write half of one accepted WS connection, shared (via `Arc<Mutex<..>>`)
@@ -135,6 +150,23 @@ async fn handle_connection(
     // just under the "unknown" client label.
     let (client_name, pending) = read_hello(&mut read).await;
 
+    // Phase 8 (D-01/D-02): mint this connection's real identity immediately
+    // after the Hello read, and send it back on a `Welcome` frame BEFORE
+    // the activity replay burst below -- `Welcome` is provably the first
+    // server-to-client frame on every connection. The session id is
+    // server-minted only; it is never derived from `client_name` or any
+    // other client-supplied value (T-08-01).
+    let conn_id = connection_registry::next_conn_id();
+    let session_id = session_id::next_session_id();
+    send_protocol(
+        &write,
+        0,
+        ProtocolFrame::Welcome {
+            session_id: session_id.clone(),
+        },
+    )
+    .await;
+
     // Replay burst (D-01, RESEARCH Pattern 2): send the registry's current
     // activity snapshot to THIS connection's own write path before it is
     // registered for live broadcast below -- a newly-connecting client
@@ -143,9 +175,10 @@ async fn handle_connection(
         send_frame(&write, &event).await;
     }
 
-    let conn_id = connection_registry::next_conn_id();
     let (tx, mut rx) = mpsc::unbounded_channel::<Envelope>();
-    registry.register(conn_id, client_name.clone(), tx).await;
+    registry
+        .register(conn_id, client_name.clone(), session_id.clone(), tx)
+        .await;
 
     // Per-connection drain task (RESEARCH Pattern 1): forwards anything
     // broadcast to this connection into its own write half. A slow drain
@@ -159,7 +192,17 @@ async fn handle_connection(
     });
 
     if let Some(envelope) = pending {
-        dispatch_envelope(envelope, &orchestrator, &write, &registry, &activity_registry, &client_name).await;
+        dispatch_envelope(
+            envelope,
+            &orchestrator,
+            &write,
+            &registry,
+            &activity_registry,
+            &client_name,
+            conn_id,
+            &session_id,
+        )
+        .await;
     }
 
     while let Some(msg) = read.next().await {
@@ -197,7 +240,17 @@ async fn handle_connection(
             }
         };
 
-        dispatch_envelope(envelope, &orchestrator, &write, &registry, &activity_registry, &client_name).await;
+        dispatch_envelope(
+            envelope,
+            &orchestrator,
+            &write,
+            &registry,
+            &activity_registry,
+            &client_name,
+            conn_id,
+            &session_id,
+        )
+        .await;
     }
 
     // Unconditional cleanup (Pitfall 2): every exit path above (`break` on
@@ -262,10 +315,23 @@ async fn dispatch_envelope(
     registry: &ConnectionRegistry,
     activity_registry: &Arc<ActivityRegistry>,
     client_name: &str,
+    conn_id: ConnId,
+    session_id: &str,
 ) {
     match envelope {
         Envelope::Req { id, payload } => {
-            handle_request(id, payload, orchestrator, write, registry, activity_registry, client_name).await;
+            handle_request(
+                id,
+                payload,
+                orchestrator,
+                write,
+                registry,
+                activity_registry,
+                client_name,
+                conn_id,
+                session_id,
+            )
+            .await;
         }
         // A client is only ever expected to send `Req` frames; a stray
         // `Res`/`Event` from a client is a protocol misuse, not a fatal
@@ -304,12 +370,27 @@ async fn dispatch_envelope(
             .to_string();
             send_error_res(write, 0, detail).await;
         }
+        // Phase 8 (D-01/D-05): `DescribeRun` is the one client-to-daemon
+        // `ProtocolFrame` variant; route it to `handle_protocol_frame`.
+        // `Welcome`/`RunDescription` are server-push-only -- a client
+        // sending either is a protocol misuse (T-08-03), same graceful
+        // handled-error, keep-serving treatment as every other stray-frame
+        // arm above, never a dropped connection.
+        Envelope::Protocol { id, frame } => {
+            handle_protocol_frame(id, frame, activity_registry, write).await;
+        }
     }
 }
 
 /// Routes one decoded `Envelope::Req` by `RequestPayload` variant, calling
 /// straight into `InProcessOrchestrator`'s existing trait methods (Pitfall
 /// 3 -- never `Registry::load`/`validate_payload` directly here).
+///
+/// `conn_id`/`session_id` (Phase 8, D-01/D-02) are threaded through
+/// additively, in the same style `client_name` was threaded (05-04) --
+/// this plan does not yet consume `conn_id` here (plan 08-03 addresses
+/// results by `conn_id`), but it must already be in scope by the time that
+/// plan lands.
 async fn handle_request(
     id: u64,
     payload: RequestPayload,
@@ -318,6 +399,8 @@ async fn handle_request(
     registry: &ConnectionRegistry,
     activity_registry: &Arc<ActivityRegistry>,
     client_name: &str,
+    conn_id: ConnId,
+    session_id: &str,
 ) {
     match payload {
         // Quick task 260807-shx Task 3: a thin decode-call-encode wrapper
@@ -365,7 +448,7 @@ async fn handle_request(
                     // is tracked from the same moment an async one is, it
                     // just never visibly passes through Running (05-03's
                     // own documented decision).
-                    let run_id = activity_registry.mint_run_id(&req.workflow_id, client_name);
+                    let run_id = activity_registry.mint_run_id(&req.workflow_id, client_name, session_id);
                     broadcast_activity(registry, activity_registry, &run_id).await;
 
                     // Await dispatch() inline via the existing
@@ -395,7 +478,7 @@ async fn handle_request(
                     // broadcast Invoked, then ack immediately with Started
                     // + the run_id, never blocking the read loop on
                     // dispatch()'s full poll loop.
-                    let run_id = activity_registry.mint_run_id(&req.workflow_id, client_name);
+                    let run_id = activity_registry.mint_run_id(&req.workflow_id, client_name, session_id);
                     broadcast_activity(registry, activity_registry, &run_id).await;
 
                     let ack = InvokeWorkflowResponse {
@@ -475,6 +558,61 @@ async fn broadcast_activity(registry: &ConnectionRegistry, activity_registry: &A
 /// already disconnected) is a handled no-op, never a panic.
 async fn send_res(write: &Arc<Mutex<WsWrite>>, id: u64, payload: ResponsePayload) {
     send_frame(write, &Envelope::Res { id, payload }).await;
+}
+
+/// Routes one decoded `ProtocolFrame` (Phase 8, D-01/D-05). The only
+/// client-to-daemon variant is `DescribeRun`: it resolves straight through
+/// the existing, read-only `ActivityRegistry::get(run_id)` -- never a
+/// re-implemented lookup, and never a mutation of registry state -- and
+/// replies with `RunDescription`. `found: false` for an unknown `run_id` is
+/// a normal reply, never a `ServerError` and never a dropped connection
+/// (T-08-02/T-08-03). `Welcome`/`RunDescription` arriving FROM a client are
+/// server-push-only misuse (T-08-03): answered with the existing graceful
+/// `ServerError::UnexpectedFrameType` treatment, connection kept alive.
+async fn handle_protocol_frame(
+    id: u64,
+    frame: ProtocolFrame,
+    activity_registry: &Arc<ActivityRegistry>,
+    write: &Arc<Mutex<WsWrite>>,
+) {
+    match frame {
+        ProtocolFrame::DescribeRun { run_id } => {
+            let event = activity_registry.get(&run_id);
+            let found = event.is_some();
+            send_protocol(
+                write,
+                id,
+                ProtocolFrame::RunDescription {
+                    run_id,
+                    found,
+                    event,
+                },
+            )
+            .await;
+        }
+        ProtocolFrame::Welcome { .. } => {
+            let detail = ServerError::UnexpectedFrameType {
+                got: "protocol:welcome".to_string(),
+            }
+            .to_string();
+            send_error_res(write, id, detail).await;
+        }
+        ProtocolFrame::RunDescription { .. } => {
+            let detail = ServerError::UnexpectedFrameType {
+                got: "protocol:run_description".to_string(),
+            }
+            .to_string();
+            send_error_res(write, id, detail).await;
+        }
+    }
+}
+
+/// Encodes and writes an `Envelope::Protocol` (Phase 8, D-01/D-05). Built on
+/// the same `send_frame` chokepoint every other reply path uses -- a send
+/// failure (e.g. the peer already disconnected) is a handled no-op, never a
+/// panic.
+async fn send_protocol(write: &Arc<Mutex<WsWrite>>, id: u64, frame: ProtocolFrame) {
+    send_frame(write, &Envelope::Protocol { id, frame }).await;
 }
 
 /// Encodes and broadcasts an `Envelope::Event` to every connected client

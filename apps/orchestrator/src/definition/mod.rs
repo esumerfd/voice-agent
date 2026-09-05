@@ -3,6 +3,12 @@
 //! Phase 1 parses/validates only the M1 fields (D-05): id, name, parameters,
 //! service. `description` is Markdown body prose, not a frontmatter field.
 //! The voice `triggers`/`intent` block is deliberately absent (D-05).
+//!
+//! Phase 8 (FMT-01) adds `intent` (D-06) and `triggers` (D-07) to
+//! `WorkflowDefinition`. Both are non-breaking defaults -- an absent
+//! `intent` resolves to `String::new()` and an absent `triggers` resolves
+//! to an empty `Vec` -- so every pre-Phase-8 workflow `.md` keeps loading
+//! with zero warnings.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -30,6 +36,24 @@ pub struct WorkflowDefinition {
     /// registry loader from the scanned path; used for the per-run log
     /// line, quick task 260719-foq).
     pub source_path: PathBuf,
+    /// D-06: a single natural-language sentence describing what this
+    /// workflow does (e.g. `"check today's calendar events"`), NOT a list
+    /// of example phrases -- Phase 9's embedding intent router matches an
+    /// utterance against this one value. Empty string when the file
+    /// declares no `intent:` key (non-breaking default -- an absent
+    /// `intent` must never become a load error or a warning for a
+    /// pre-Phase-8 workflow file).
+    pub intent: String,
+    /// D-07: a flat list of trigger-type name strings (e.g.
+    /// `["cli", "voice"]`) scoped to WHAT CAN INVOKE this workflow -- never
+    /// scheduling or event config, which belongs to a future trigger-engine
+    /// phase. Author order and duplicate entries are preserved verbatim
+    /// (never sorted or deduped). Empty when the file declares no
+    /// `triggers:` key. Deliberately NOT validated against a closed enum so
+    /// a richer entry shape can be introduced later without a breaking
+    /// change, and a trigger name carries no dispatch or authorization
+    /// meaning in this phase.
+    pub triggers: Vec<String>,
 }
 
 /// A single parameter's schema (WF-03): name (map key) + type + required.

@@ -35,6 +35,12 @@ pub struct ActivityRecord {
     pub run_id: String,
     pub workflow_id: String,
     pub client_name: String,
+    /// The server-minted session id (D-01/D-02) of the connection that
+    /// started this run. `#[serde(default)]` so a pre-Phase-8 persisted
+    /// line (no `session_id` key) still replays cleanly as an empty
+    /// session id rather than being skipped as malformed.
+    #[serde(default)]
+    pub session_id: String,
     pub phase: ActivityPhase,
     pub at_ms: u64,
     pub detail: Option<serde_json::Value>,
@@ -226,5 +232,23 @@ mod tests {
             parse_date_from_filename(OsStr::new("activities-2020-01-01.jsonl")),
             Some(days_from_civil(2020, 1, 1))
         );
+    }
+
+    /// D-01/D-02/T-08-04: an `ActivityRecord` JSON line written before
+    /// Phase 8 carries no `session_id` key. `#[serde(default)]` must let it
+    /// deserialize as an empty session id rather than failing to replay.
+    #[test]
+    fn activity_record_deserializes_with_empty_session_id_when_key_is_absent() {
+        let json_str = r#"{
+            "run_id": "run-1",
+            "workflow_id": "set_timer",
+            "client_name": "orchestrator-cli",
+            "phase": "invoked",
+            "at_ms": 1000,
+            "detail": null
+        }"#;
+        let parsed: ActivityRecord =
+            serde_json::from_str(json_str).expect("legacy record without session_id must deserialize");
+        assert_eq!(parsed.session_id, "", "missing session_id must default to empty string");
     }
 }

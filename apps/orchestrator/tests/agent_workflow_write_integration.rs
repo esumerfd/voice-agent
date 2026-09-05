@@ -26,6 +26,8 @@ fn base_request(id: &str) -> CreateWorkflowRequest {
         parameters: Vec::new(),
         mode: WorkflowWriteMode::Create,
         agent: None,
+        intent: None,
+        triggers: Vec::new(),
     }
 }
 

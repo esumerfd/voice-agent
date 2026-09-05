@@ -55,6 +55,8 @@ fn workflow_with_command(command: &Path) -> WorkflowDefinition {
             agent: None,
         },
         source_path: PathBuf::from("test.md"),
+        intent: String::new(),
+        triggers: Vec::new(),
     }
 }
 

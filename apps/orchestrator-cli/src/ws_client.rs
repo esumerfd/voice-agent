@@ -103,6 +103,12 @@ impl WsOrchestratorClient {
                     // client (05-04) is the one that actually consumes these.
                     Envelope::Hello { .. } => {}
                     Envelope::Activity { .. } => {}
+                    // Phase 8 (D-01/D-05): orchestrator-cli doesn't consume
+                    // the Phase 8 protocol frames yet -- it never sends a
+                    // DescribeRun, so a Welcome or RunDescription arriving
+                    // is ignored rather than treated as unexpected,
+                    // mirroring the Req no-op arm above.
+                    Envelope::Protocol { .. } => {}
                 }
             }
         });

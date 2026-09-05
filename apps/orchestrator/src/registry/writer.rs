@@ -39,6 +39,18 @@ pub const MAX_AGENT_FILES: usize = 50;
 /// Quick task 260813-rm5, D-7: generous for a real relative path while
 /// bounding a single oversized entry.
 pub const MAX_AGENT_FILE_LEN: usize = 512;
+/// Phase 8 (T-08-07): bounds a single `intent` sentence (D-06) arriving
+/// from the wire before any filesystem call -- generous for a real
+/// natural-language sentence while bounding an oversized value.
+pub const MAX_INTENT_LEN: usize = 1024;
+/// Phase 8 (T-08-07): bounds the `triggers` list (D-07) arriving from the
+/// wire before any filesystem call -- generous for real trigger-type names
+/// while bounding an unbounded list.
+pub const MAX_TRIGGERS: usize = 32;
+/// Phase 8 (T-08-07): bounds a single `triggers` entry's length -- a
+/// trigger-type name (e.g. `cli`, `voice`) is short; this is an internal
+/// implementation detail, not part of the module's public API surface.
+const MAX_TRIGGER_ENTRY_LEN: usize = 128;
 
 /// The daemon-side absolute paths written by a successful create.
 #[derive(Debug)]
@@ -97,6 +109,15 @@ struct Frontmatter {
     name: String,
     parameters: BTreeMap<String, FmParameter>,
     service: FmService,
+    /// Phase 8 (D-06). Skipped when absent so a request declaring neither
+    /// `intent` nor `triggers` emits byte-identical frontmatter to what this
+    /// module emitted before this phase.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    intent: Option<String>,
+    /// Phase 8 (D-07). Skipped when empty for the same reason as `intent`
+    /// above.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    triggers: Vec<String>,
 }
 
 /// Writes a workflow `.md` (and, when `req.script` is `Some`, a companion
@@ -126,6 +147,10 @@ pub fn create_workflow(
     if let Some(agent) = &req.agent {
         validate_agent_files(&agent.files)?;
     }
+    if let Some(intent) = &req.intent {
+        validate_content_len(intent, MAX_INTENT_LEN)?;
+    }
+    validate_triggers(&req.triggers)?;
 
     fs::create_dir_all(workflows_dir).map_err(|e| CreateError::Io {
         path: workflows_dir.to_path_buf(),
@@ -203,6 +228,8 @@ pub fn create_workflow(
         name: req.name.clone(),
         parameters,
         service,
+        intent: req.intent.clone(),
+        triggers: req.triggers.clone(),
     };
 
     let file_contents = render_file(&frontmatter, &req.description, &md_path)?;
@@ -382,6 +409,30 @@ fn validate_content_len(content: &str, max: usize) -> Result<(), CreateError> {
     let len = content.len();
     if len > max {
         return Err(CreateError::ContentTooLarge { len, max });
+    }
+    Ok(())
+}
+
+/// Phase 8 (T-08-07): `req.triggers` is bounded before any filesystem call
+/// -- the list itself is capped at `MAX_TRIGGERS` entries and each entry at
+/// `MAX_TRIGGER_ENTRY_LEN` characters. Reuses `CreateError::ContentTooLarge`
+/// (the existing size-violation shape) rather than introducing a new
+/// variant.
+fn validate_triggers(triggers: &[String]) -> Result<(), CreateError> {
+    if triggers.len() > MAX_TRIGGERS {
+        return Err(CreateError::ContentTooLarge {
+            len: triggers.len(),
+            max: MAX_TRIGGERS,
+        });
+    }
+    for entry in triggers {
+        let len = entry.chars().count();
+        if len > MAX_TRIGGER_ENTRY_LEN {
+            return Err(CreateError::ContentTooLarge {
+                len,
+                max: MAX_TRIGGER_ENTRY_LEN,
+            });
+        }
     }
     Ok(())
 }

@@ -13,7 +13,7 @@ use std::sync::Arc;
 use futures_util::{SinkExt, StreamExt};
 use orchestrator::registry::writer;
 use orchestrator::{activity::ActivityRegistry, DeleteError, Envelope, InProcessOrchestrator, RequestPayload, ResponsePayload, Service};
-use shared::{CreateWorkflowRequest, DeleteWorkflowRequest, ListWorkflowsRequest};
+use shared::{CreateWorkflowRequest, DeleteWorkflowRequest, ListWorkflowsRequest, ProtocolFrame};
 use tempfile::TempDir;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::tungstenite::Message;
@@ -60,6 +60,8 @@ fn script_backed_delete_removes_both_the_md_and_the_companion_script() {
         parameters: Vec::new(),
         mode: shared::WorkflowWriteMode::Create,
     agent: None,
+    intent: None,
+    triggers: Vec::new(),
     };
     let create_outcome = writer::create_workflow(dir.path(), &req).expect("fixture create should succeed");
     let script_fixture_path = create_outcome.script_path.clone().expect("expected a script_path");
@@ -242,6 +244,11 @@ async fn send(ws: &mut WsStream, envelope: &Envelope) {
     ws.send(Message::text(text)).await.expect("failed to send frame");
 }
 
+/// Receives the next frame, transparently skipping any `Envelope::Activity`
+/// broadcast frame, and any `Envelope::Protocol(Welcome)` frame (Phase 8,
+/// D-01): every accepted connection now receives a server-minted session
+/// id as its first server-to-client frame, ahead of the activity replay
+/// burst.
 async fn recv(ws: &mut WsStream) -> Envelope {
     loop {
         let msg = ws
@@ -251,7 +258,12 @@ async fn recv(ws: &mut WsStream) -> Envelope {
             .expect("expected a valid WS message");
         let text = msg.to_text().expect("expected a text frame");
         let envelope: Envelope = serde_json::from_str(text).expect("expected a valid Envelope");
-        if matches!(envelope, Envelope::Activity { .. }) {
+        if matches!(envelope, Envelope::Activity { .. })
+            || matches!(
+                envelope,
+                Envelope::Protocol { frame: ProtocolFrame::Welcome { .. }, .. }
+            )
+        {
             continue;
         }
         return envelope;
@@ -269,6 +281,8 @@ async fn wire_delete_workflow_removes_the_file_and_connection_stays_alive() {
         parameters: Vec::new(),
         mode: shared::WorkflowWriteMode::Create,
     agent: None,
+    intent: None,
+    triggers: Vec::new(),
     };
     let create_outcome = writer::create_workflow(dir.path(), &req).expect("fixture create should succeed");
     let script_path = create_outcome.script_path.clone().expect("expected a script_path");

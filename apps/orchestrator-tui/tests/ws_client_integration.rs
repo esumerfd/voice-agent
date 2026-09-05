@@ -30,6 +30,7 @@ fn sample_activity_event() -> ActivityEvent {
         run_id: "run-1".to_string(),
         workflow_id: "set_timer".to_string(),
         client_name: "orchestrator-tui".to_string(),
+        session_id: "sess-1".to_string(),
         status: ActivityStatus::Running,
         started_at_ms: 1_000,
         log: vec![ActivityLogEvent {

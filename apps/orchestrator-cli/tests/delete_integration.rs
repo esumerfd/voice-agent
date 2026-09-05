@@ -115,6 +115,8 @@ async fn direct_delete_removes_the_md_file() {
         parameters: Vec::new(),
         mode: shared::WorkflowWriteMode::Create,
     agent: None,
+    intent: None,
+    triggers: Vec::new(),
     };
     let outcome = orchestrator::registry::writer::create_workflow(dir.path(), &req)
         .expect("fixture create_workflow should succeed");

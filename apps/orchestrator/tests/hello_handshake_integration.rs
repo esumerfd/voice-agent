@@ -14,6 +14,8 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
+use shared::ProtocolFrame;
+
 use orchestrator::activity::ActivityRegistry;
 use orchestrator::{
     Envelope, InProcessOrchestrator, ListWorkflowsRequest, RequestPayload, ResponsePayload,
@@ -70,14 +72,28 @@ async fn send(ws: &mut WsStream, envelope: &Envelope) {
     ws.send(Message::text(text)).await.expect("failed to send frame");
 }
 
+/// Receives the next frame, transparently skipping the connection's own
+/// `Welcome` frame (Phase 8, D-01): every accepted connection now receives
+/// a server-minted session id as its first server-to-client frame
+/// (regardless of whether its `Hello` was present/valid), which would
+/// otherwise be mistaken for the `Res` these pre-existing tests assert on.
 async fn recv(ws: &mut WsStream) -> Envelope {
-    let msg = ws
-        .next()
-        .await
-        .expect("expected a frame before the stream ended")
-        .expect("expected a valid WS message");
-    let text = msg.to_text().expect("expected a text frame");
-    serde_json::from_str(text).expect("expected a valid Envelope")
+    loop {
+        let msg = ws
+            .next()
+            .await
+            .expect("expected a frame before the stream ended")
+            .expect("expected a valid WS message");
+        let text = msg.to_text().expect("expected a text frame");
+        let envelope: Envelope = serde_json::from_str(text).expect("expected a valid Envelope");
+        if matches!(
+            envelope,
+            Envelope::Protocol { frame: ProtocolFrame::Welcome { .. }, .. }
+        ) {
+            continue;
+        }
+        return envelope;
+    }
 }
 
 #[tokio::test]

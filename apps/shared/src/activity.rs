@@ -63,6 +63,14 @@ pub struct ActivityEvent {
     pub run_id: String,
     pub workflow_id: String,
     pub client_name: String,
+    /// The server-minted session id (D-01) of the connection that started
+    /// this run -- this, not `client_name`, is the connection's identity
+    /// (D-02); `client_name` beside it stays a display label only.
+    /// `#[serde(default)]` so an `ActivityEvent` reconstructed from a
+    /// pre-Phase-8 persisted record (no `session_id` key) deserializes as
+    /// an empty session id rather than failing to replay.
+    #[serde(default)]
+    pub session_id: String,
     pub status: ActivityStatus,
     pub started_at_ms: u64,
     pub log: Vec<ActivityLogEvent>,
@@ -79,6 +87,7 @@ mod tests {
             run_id: "run-1".to_string(),
             workflow_id: "set_timer".to_string(),
             client_name: "orchestrator-tui".to_string(),
+            session_id: "sess-1".to_string(),
             status: ActivityStatus::Success,
             started_at_ms: 1_000,
             log: vec![
@@ -147,8 +156,38 @@ mod tests {
         assert_eq!(parsed.run_id, "run-1");
         assert_eq!(parsed.workflow_id, "set_timer");
         assert_eq!(parsed.client_name, "orchestrator-tui");
+        assert_eq!(parsed.session_id, "sess-1");
         assert_eq!(parsed.status, ActivityStatus::Success);
         assert_eq!(parsed.started_at_ms, 1_000);
         assert_eq!(parsed.log.len(), 2);
+    }
+
+    /// D-01/D-02: a pre-Phase-8 persisted `ActivityEvent` JSON payload never
+    /// carried a `session_id` key. `#[serde(default)]` must let it
+    /// deserialize as an empty session id rather than failing to replay.
+    #[test]
+    fn activity_event_deserializes_with_empty_session_id_when_key_is_absent() {
+        let json_str = r#"{
+            "run_id": "run-1",
+            "workflow_id": "set_timer",
+            "client_name": "orchestrator-tui",
+            "status": "success",
+            "started_at_ms": 1000,
+            "log": []
+        }"#;
+        let parsed: ActivityEvent =
+            serde_json::from_str(json_str).expect("legacy event without session_id must deserialize");
+        assert_eq!(parsed.session_id, "", "missing session_id must default to empty string");
+    }
+
+    /// The new field must also round-trip normally when present.
+    #[test]
+    fn activity_event_round_trips_with_session_id_present() {
+        let event = sample_event();
+        assert_eq!(event.session_id, "sess-1");
+        let json_string = serde_json::to_string(&event).expect("to_string");
+        assert!(json_string.contains("\"session_id\":\"sess-1\""));
+        let parsed: ActivityEvent = serde_json::from_str(&json_string).expect("from_str");
+        assert_eq!(parsed.session_id, "sess-1");
     }
 }

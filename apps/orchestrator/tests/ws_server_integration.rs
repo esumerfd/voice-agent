@@ -18,6 +18,7 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
+use shared::ProtocolFrame;
 use tempfile::TempDir;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::tungstenite::Message;
@@ -109,7 +110,10 @@ async fn send(ws: &mut WsStream, envelope: &Envelope) {
 /// frame type that can arrive interleaved with the Res/Event frames these
 /// pre-existing tests assert on -- including on the very connection that
 /// triggered the activity, since broadcast reaches every registered
-/// connection (D-01's "every client sees every activity").
+/// connection (D-01's "every client sees every activity") -- and any
+/// `Envelope::Protocol(Welcome)` frame (Phase 8, D-01): every accepted
+/// connection now receives a server-minted session id as its first
+/// server-to-client frame, ahead of the activity replay burst.
 async fn recv(ws: &mut WsStream) -> Envelope {
     loop {
         let msg = ws
@@ -119,7 +123,12 @@ async fn recv(ws: &mut WsStream) -> Envelope {
             .expect("expected a valid WS message");
         let text = msg.to_text().expect("expected a text frame");
         let envelope: Envelope = serde_json::from_str(text).expect("expected a valid Envelope");
-        if matches!(envelope, Envelope::Activity { .. }) {
+        if matches!(envelope, Envelope::Activity { .. })
+            || matches!(
+                envelope,
+                Envelope::Protocol { frame: ProtocolFrame::Welcome { .. }, .. }
+            )
+        {
             continue;
         }
         return envelope;

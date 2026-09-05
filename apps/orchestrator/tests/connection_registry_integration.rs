@@ -17,6 +17,8 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
+use shared::ProtocolFrame;
+
 use orchestrator::activity::ActivityRegistry;
 use orchestrator::handlers::timers::TimerService;
 use orchestrator::{
@@ -78,7 +80,10 @@ async fn send(ws: &mut WsStream, envelope: &Envelope) {
 /// Receives the next frame, transparently skipping any `Envelope::Activity`
 /// broadcast frames (05-05, D-01) -- these now interleave with the Res/Event
 /// frames this file's tests assert on, including on the invoking connection
-/// itself (broadcast reaches every registered connection).
+/// itself (broadcast reaches every registered connection) -- and any
+/// `Envelope::Protocol(Welcome)` frame (Phase 8, D-01): every accepted
+/// connection now receives a server-minted session id as its first
+/// server-to-client frame, ahead of the activity replay burst.
 async fn recv(ws: &mut WsStream) -> Envelope {
     loop {
         let msg = ws
@@ -88,7 +93,12 @@ async fn recv(ws: &mut WsStream) -> Envelope {
             .expect("expected a valid WS message");
         let text = msg.to_text().expect("expected a text frame");
         let envelope: Envelope = serde_json::from_str(text).expect("expected a valid Envelope");
-        if matches!(envelope, Envelope::Activity { .. }) {
+        if matches!(envelope, Envelope::Activity { .. })
+            || matches!(
+                envelope,
+                Envelope::Protocol { frame: ProtocolFrame::Welcome { .. }, .. }
+            )
+        {
             continue;
         }
         return envelope;

@@ -149,6 +149,10 @@ pub async fn run<W: Write>(
         parameters,
         mode,
         agent,
+        // Phase 8 (D-06/D-07): the CLI does not populate these yet --
+        // Phase 10's creation UI is the first producer.
+        intent: None,
+        triggers: Vec::new(),
     };
 
     let resp = client.create_workflow(req).await;

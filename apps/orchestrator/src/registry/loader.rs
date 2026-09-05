@@ -7,7 +7,14 @@
 //!
 //! Raw deserialization structs use all-`Option` fields so a missing
 //! required field is named by `validate_definition`, not by a serde
-//! hard-fail (D-08). No `triggers`/`intent` fields are declared (D-05).
+//! hard-fail (D-08).
+//!
+//! Phase 8 (FMT-01) adds `intent` (D-06) and `triggers` (D-07) to
+//! `RawFrontmatter`. Both resolve via non-breaking defaults in
+//! `validate_definition` rather than `required_string` -- the ROADMAP's own
+//! success criterion for Phase 8 requires that every workflow `.md` file
+//! committed before this phase still loads with zero warnings, which a hard
+//! `required_string` on either field would violate.
 
 use std::collections::HashMap;
 use std::fs;
@@ -72,14 +79,18 @@ struct RawAgent {
     timeout_secs: Option<u64>,
 }
 
-/// Raw top-level frontmatter. Deliberately excludes `triggers`/`intent`
-/// (D-05) — Phase 1 parses/validates only the M1 fields.
+/// Raw top-level frontmatter. `intent`/`triggers` (Phase 8, D-06/D-07) are
+/// `Option` like every other optional field here -- an absent, empty, or
+/// explicit YAML `null` value resolves to a non-breaking default in
+/// `validate_definition`, never a `LoadError`.
 #[derive(Debug, Deserialize)]
 struct RawFrontmatter {
     id: Option<String>,
     name: Option<String>,
     parameters: Option<HashMap<String, RawParameter>>,
     service: Option<RawService>,
+    intent: Option<String>,
+    triggers: Option<Vec<String>>,
 }
 
 impl Registry {
@@ -335,6 +346,20 @@ fn validate_definition(
         }
     });
 
+    // D-06: absent/empty/whitespace-only `intent` resolves to the empty
+    // string rather than a MissingField error -- mirrors `handler`'s
+    // absent-resolves-to-default precedent above, not `id`/`name`'s
+    // hard-required precedent, per the ROADMAP's zero-warnings criterion.
+    let intent = match raw.intent {
+        Some(s) if !s.trim().is_empty() => s,
+        _ => String::new(),
+    };
+
+    // D-07: absent `triggers` (or an explicit YAML null, which deserializes
+    // to `None` here) resolves to an empty list. Author order and
+    // duplicates are preserved verbatim -- no sorting, no deduping.
+    let triggers = raw.triggers.unwrap_or_default();
+
     Ok(WorkflowDefinition {
         id,
         name,
@@ -349,5 +374,7 @@ fn validate_definition(
             agent,
         },
         source_path: path_buf,
+        intent,
+        triggers,
     })
 }

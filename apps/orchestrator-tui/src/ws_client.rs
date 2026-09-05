@@ -125,6 +125,12 @@ impl TuiWsClient {
                     Envelope::Req { .. } | Envelope::Hello { .. } => {
                         // orchestratord never sends a Req/Hello to a client; ignore defensively.
                     }
+                    // Phase 8 (D-01/D-05): orchestrator-tui doesn't consume
+                    // the Phase 8 protocol frames yet -- it renders run
+                    // state exclusively from Activity frames, so a Welcome
+                    // or RunDescription is ignored rather than treated as
+                    // unexpected, mirroring the Req/Hello no-op arm above.
+                    Envelope::Protocol { .. } => {}
                 }
             }
         });

@@ -19,7 +19,7 @@ use orchestrator::{
     activity::ActivityRegistry, CreateError, Envelope, InProcessOrchestrator, ListWorkflowsRequest,
     Registry, RequestPayload, ResponsePayload, Service,
 };
-use shared::{CreateWorkflowRequest, ParameterDescriptor, ParameterType};
+use shared::{CreateWorkflowRequest, ParameterDescriptor, ParameterType, ProtocolFrame};
 use tempfile::TempDir;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::tungstenite::Message;
@@ -36,6 +36,8 @@ fn base_request(id: &str) -> CreateWorkflowRequest {
         parameters: Vec::new(),
         mode: shared::WorkflowWriteMode::Create,
     agent: None,
+    intent: None,
+    triggers: Vec::new(),
     }
 }
 
@@ -69,6 +71,8 @@ fn markdown_only_create_round_trips_through_registry_load() {
         parameters: Vec::new(),
         mode: shared::WorkflowWriteMode::Create,
     agent: None,
+    intent: None,
+    triggers: Vec::new(),
     };
 
     let outcome = writer::create_workflow(dir.path(), &req).expect("create_workflow should succeed");
@@ -95,6 +99,8 @@ fn script_create_writes_executable_script_and_command_resolves_to_existing_file(
         parameters: Vec::new(),
         mode: shared::WorkflowWriteMode::Create,
     agent: None,
+    intent: None,
+    triggers: Vec::new(),
     };
 
     let outcome = writer::create_workflow(dir.path(), &req).expect("create_workflow should succeed");
@@ -302,7 +308,10 @@ async fn send(ws: &mut WsStream, envelope: &Envelope) {
 }
 
 /// Receives the next frame, transparently skipping any `Envelope::Activity`
-/// broadcast frame (mirrors `ws_server_integration.rs::recv`).
+/// broadcast frame (mirrors `ws_server_integration.rs::recv`), and any
+/// `Envelope::Protocol(Welcome)` frame (Phase 8, D-01): every accepted
+/// connection now receives a server-minted session id as its first
+/// server-to-client frame, ahead of the activity replay burst.
 async fn recv(ws: &mut WsStream) -> Envelope {
     loop {
         let msg = ws
@@ -312,7 +321,12 @@ async fn recv(ws: &mut WsStream) -> Envelope {
             .expect("expected a valid WS message");
         let text = msg.to_text().expect("expected a text frame");
         let envelope: Envelope = serde_json::from_str(text).expect("expected a valid Envelope");
-        if matches!(envelope, Envelope::Activity { .. }) {
+        if matches!(envelope, Envelope::Activity { .. })
+            || matches!(
+                envelope,
+                Envelope::Protocol { frame: ProtocolFrame::Welcome { .. }, .. }
+            )
+        {
             continue;
         }
         return envelope;
@@ -335,6 +349,8 @@ async fn wire_create_workflow_markdown_only_succeeds_and_file_exists() {
             parameters: Vec::new(),
             mode: shared::WorkflowWriteMode::Create,
         agent: None,
+        intent: None,
+        triggers: Vec::new(),
         }),
     };
     send(&mut ws, &req).await;
@@ -374,6 +390,8 @@ async fn wire_create_workflow_with_script_succeeds_and_both_files_exist() {
             parameters: Vec::new(),
             mode: shared::WorkflowWriteMode::Create,
         agent: None,
+        intent: None,
+        triggers: Vec::new(),
         }),
     };
     send(&mut ws, &req).await;
@@ -410,6 +428,8 @@ async fn wire_create_workflow_traversal_id_rejected_and_connection_stays_alive()
             parameters: Vec::new(),
             mode: shared::WorkflowWriteMode::Create,
         agent: None,
+        intent: None,
+        triggers: Vec::new(),
         }),
     };
     send(&mut ws, &req).await;
@@ -460,6 +480,8 @@ async fn wire_create_workflow_then_list_on_same_connection_shows_new_id_with_no_
             parameters: Vec::new(),
             mode: shared::WorkflowWriteMode::Create,
         agent: None,
+        intent: None,
+        triggers: Vec::new(),
         }),
     };
     send(&mut ws, &create_req).await;
@@ -507,6 +529,8 @@ async fn wire_duplicate_create_returns_created_false_with_error_naming_the_id() 
             parameters: Vec::new(),
             mode: shared::WorkflowWriteMode::Create,
         agent: None,
+        intent: None,
+        triggers: Vec::new(),
         }),
     };
 

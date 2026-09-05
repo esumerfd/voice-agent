@@ -176,6 +176,22 @@ pub struct CreateWorkflowRequest {
     /// shape would be greedily absorbed by `CreateWorkflow`'s earlier,
     /// less-specific-looking match.
     pub agent: Option<AgentConfig>,
+    /// Write-path counterpart of `registry::loader`'s `RawFrontmatter.intent`
+    /// (Phase 8, D-06): a single natural-language sentence, not a list of
+    /// example phrases. `#[serde(default)]` so a request from a client that
+    /// has never heard of this field still deserializes exactly as it does
+    /// today. The CLI does not populate this yet -- Phase 10's creation UI
+    /// is the first producer.
+    #[serde(default)]
+    pub intent: Option<String>,
+    /// Write-path counterpart of `registry::loader`'s
+    /// `RawFrontmatter.triggers` (Phase 8, D-07): a flat list of
+    /// trigger-type name strings, never per-trigger config objects.
+    /// `#[serde(default)]` so a request predating this field still
+    /// deserializes to an empty list. The CLI does not populate this yet --
+    /// Phase 10's creation UI is the first producer.
+    #[serde(default)]
+    pub triggers: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

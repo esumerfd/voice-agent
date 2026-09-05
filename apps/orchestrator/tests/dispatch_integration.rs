@@ -169,6 +169,8 @@ fn workflow_with_command(command: Option<&str>, args: Vec<&str>) -> WorkflowDefi
             agent: None,
         },
         source_path: std::path::PathBuf::from("test.md"),
+        intent: String::new(),
+        triggers: Vec::new(),
     }
 }
 
@@ -189,6 +191,8 @@ fn workflow_with_params(parameters: HashMap<String, ParameterSpec>) -> WorkflowD
             agent: None,
         },
         source_path: std::path::PathBuf::from("test.md"),
+        intent: String::new(),
+        triggers: Vec::new(),
     }
 }
 
@@ -389,6 +393,8 @@ fn workflow_set_timer() -> WorkflowDefinition {
             agent: None,
         },
         source_path: std::path::PathBuf::from("test.md"),
+        intent: String::new(),
+        triggers: Vec::new(),
     }
 }
 
@@ -565,6 +571,8 @@ fn workflow_with_agent(agent: AgentSpec) -> WorkflowDefinition {
             agent: Some(agent),
         },
         source_path: std::path::PathBuf::from("test.md"),
+        intent: String::new(),
+        triggers: Vec::new(),
     }
 }
 

@@ -779,6 +779,7 @@ mod tests {
             run_id: run_id.to_string(),
             workflow_id: "set_timer".to_string(),
             client_name: client_name.to_string(),
+            session_id: "sess-1".to_string(),
             status,
             started_at_ms,
             log: vec![
