@@ -1,7 +1,7 @@
 class Orchestratord < Formula
   desc "Local voice-agent orchestrator daemon, CLI, and TUI"
   homepage "https://github.com/esumerfd/voice-agent"
-  version "0.0.1"
+  version "0.1.1"
   license "MIT"
 
   depends_on :macos
@@ -12,14 +12,13 @@ class Orchestratord < Formula
   # independently-versioned product. voice-agent exposes exactly one
   # ("orchestrator": apps/orchestrator/Makefile is its only `release:`
   # target), but the tag still carries the product name. version/sha256
-  # below still point at the last release cut under the OLD bare-tag
-  # scheme (v0.0.1) -- both need a real update once the first release
-  # under the new pipeline actually ships; a fabricated checksum here
-  # would be worse than an honestly stale one.
+  # below are kept in sync automatically going forward by this repo's own
+  # release.yml (its update-formula job, downstream of the shared
+  # workflow) -- this is the first release cut under that pipeline.
   on_macos do
     on_intel do
       url "https://github.com/esumerfd/voice-agent/releases/download/orchestrator-v#{version}/voice-agent-v#{version}-x86_64-apple-darwin.tar.gz"
-      sha256 "1c6090e50e5d6c83c3177d0d255e93eabaa8c780700503a3775fa2ce235ef98e"
+      sha256 "2e9c1fd8e1109197035e5f65af72ef46c3c4c4522b07f63127986c2643658a5e"
     end
   end
 
