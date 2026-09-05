@@ -15,9 +15,15 @@ name: Release
 #
 # NOTE (tag naming changed): releases are now tagged `orchestrator-vX.Y.Z`
 # -- not the bare `vX.Y.Z` this repo used through v0.1.0. The Homebrew
-# Formula's `url` template was updated to match (see Formula/orchestratord.rb);
-# its `version`/`sha256` still need a real update once the first release
-# under this pipeline actually ships, same as any release.
+# Formula's `url` template was updated to match (see Formula/orchestratord.rb).
+#
+# update-formula (below) is the caller-side half of the Formula/Cask
+# contract esumerfd/actions' shared workflow deliberately punts to
+# consumers: it outputs released_products (name/version/tag), never
+# touches a Formula or Cask itself. This job is what actually consumes
+# that output -- patching Formula/orchestratord.rb's version and sha256
+# once the release (and its uploaded .sha256 sidecar, produced by
+# apps/orchestrator/Makefile's release: target) actually exist.
 on:
   workflow_dispatch:
 
@@ -28,3 +34,50 @@ jobs:
     uses: esumerfd/actions/.github/workflows/release.yml@main
     with:
       bump: patch
+
+  update-formula:
+    needs: release
+    if: needs.release.outputs.released_products != '[]'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      # main already carries the shared workflow's own post-release version
+      # bump by the time this runs -- `needs: release` waits for the whole
+      # reusable-workflow call, including its internal bump job, not just
+      # the build step.
+      - name: Checkout main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: main
+
+      - name: Patch Formula/orchestratord.rb with the released version + checksum
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASED_JSON: ${{ needs.release.outputs.released_products }}
+        run: |
+          set -euo pipefail
+          TAG=$(echo "$RELEASED_JSON" | jq -r '.[] | select(.name == "orchestrator") | .tag')
+          VERSION=$(echo "$RELEASED_JSON" | jq -r '.[] | select(.name == "orchestrator") | .version')
+          if [ -z "$TAG" ]; then
+            echo "orchestrator was not released this run -- nothing to patch"
+            exit 0
+          fi
+
+          # Formula is Intel-only (on_intel do, no on_arm) -- the x86_64
+          # sidecar is the one it needs, even though this repo's release
+          # now also builds an unused aarch64 asset (the shared workflow's
+          # default matrix_targets, not something this Formula consumes
+          # yet).
+          ASSET="voice-agent-v${VERSION}-x86_64-apple-darwin.tar.gz"
+          gh release download "$TAG" --repo "${{ github.repository }}" --pattern "${ASSET}.sha256" --output "${ASSET}.sha256"
+          SHA256=$(tr -d '[:space:]' < "${ASSET}.sha256")
+
+          sed -i "s/^  version \".*\"/  version \"${VERSION}\"/" Formula/orchestratord.rb
+          sed -i "s/sha256 \"[a-f0-9]\{64\}\"/sha256 \"${SHA256}\"/" Formula/orchestratord.rb
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/orchestratord.rb
+          git commit -m "chore(formula): update orchestratord to ${TAG}"
+          git push origin HEAD:main
