@@ -1,7 +1,7 @@
 class Orchestratord < Formula
   desc "Local voice-agent orchestrator daemon, CLI, and TUI"
   homepage "https://github.com/esumerfd/voice-agent"
-  version "0.1.1"
+  version "0.1.2"
   license "MIT"
 
   depends_on :macos
@@ -18,7 +18,7 @@ class Orchestratord < Formula
   on_macos do
     on_intel do
       url "https://github.com/esumerfd/voice-agent/releases/download/orchestrator-v#{version}/voice-agent-v#{version}-x86_64-apple-darwin.tar.gz"
-      sha256 "2e9c1fd8e1109197035e5f65af72ef46c3c4c4522b07f63127986c2643658a5e"
+      sha256 "5b40b70977aea2411a7e13df61af916e221f287895cfae801a5b17ee8b476f3c"
     end
   end
 
