@@ -76,6 +76,16 @@ pub struct Router {
     last_sync: tokio::sync::Mutex<cache::SyncStats>,
 }
 
+/// Whether a candidate's similarity score clears the threshold it must
+/// meet -- inclusive: a score exactly equal to `required` is a match, one
+/// representable `f32` step below is not (ROUT-02/ROUT-04 boundary probe).
+/// Extracted as its own pure function so the inclusive-boundary contract is
+/// directly, bit-exactly testable without depending on `cosine_similarity`'s
+/// floating-point rounding to land on an exact score by construction.
+fn clears_threshold(score: f32, required: f32) -> bool {
+    score >= required
+}
+
 impl Router {
     pub fn new(client: Arc<dyn OllamaApi>, embed_model: impl Into<String>) -> Self {
         Self {
@@ -95,7 +105,47 @@ impl Router {
     /// Resolves `utterance` to the nearest-intent workflow in `registry`
     /// via cosine similarity, syncing the embedding cache against the
     /// registry's current `(id, intent)` pairs first (D-06).
+    ///
+    /// A bounded, allocation-free guard runs BEFORE the cache sync and
+    /// before any client call: an empty (or whitespace-only, after
+    /// trimming) utterance, or one over `threshold::MAX_UTTERANCE_CHARS`
+    /// Unicode code points, is REJECTED rather than truncated (mirrors
+    /// `server/mod.rs`'s `MAX_CLIENT_NAME_LEN` discipline) -- the mock's
+    /// embed-call counter is provably 0 for either case. Length is always
+    /// measured in code points (`chars().count()`), never a raw byte
+    /// length, and no Unicode normalization form is ever applied anywhere
+    /// in this pipeline -- `EmbeddingCache::sync` compares `intent` strings
+    /// byte-for-byte, so two normalization variants of the same visible
+    /// text are two different strings and re-embed, which is the safe
+    /// direction.
     pub async fn route(&self, utterance: &str, registry: &Registry) -> Result<RouteOutcome, RouterError> {
+        let trimmed = utterance.trim();
+        if trimmed.is_empty() {
+            return Ok(RouteOutcome {
+                utterance: utterance.to_string(),
+                matched_workflow_id: None,
+                similarity_score: None,
+                confirm_tier: None,
+                extracted_params: None,
+                detail: Some("utterance is empty (or whitespace-only) after trimming".to_string()),
+            });
+        }
+        let char_count = trimmed.chars().count();
+        if char_count > threshold::MAX_UTTERANCE_CHARS {
+            return Ok(RouteOutcome {
+                utterance: utterance.to_string(),
+                matched_workflow_id: None,
+                similarity_score: None,
+                confirm_tier: None,
+                extracted_params: None,
+                detail: Some(format!(
+                    "utterance is {char_count} Unicode code points, exceeding the \
+                     {}-code-point limit",
+                    threshold::MAX_UTTERANCE_CHARS
+                )),
+            });
+        }
+
         let utterance = utterance.to_string();
 
         // Candidates: every workflow whose trimmed `intent` is non-empty,
@@ -161,14 +211,34 @@ impl Router {
         }
         drop(cache);
 
+        // Threshold applied at the end of the scan, never mid-loop: the
+        // winning candidate is reported only when its score is `>=`
+        // `MATCH_THRESHOLD` (inclusive at the boundary -- an exact match
+        // matches, one representable f32 step below refuses). Task 3 wires
+        // in the stricter `CONFIRM_REQUIRED_MATCH_THRESHOLD` for a
+        // `ConfirmRequired`-tier winner. Below the bar, the refusal names
+        // the best observed score and the threshold it failed -- never the
+        // runner-up id, so no caller can mistake a refusal for a weak
+        // suggestion.
         Ok(match best {
-            Some((id, score)) => RouteOutcome {
+            Some((id, score)) if clears_threshold(score, threshold::MATCH_THRESHOLD) => RouteOutcome {
                 utterance,
                 matched_workflow_id: Some(id),
                 similarity_score: Some(score),
                 confirm_tier: None,
                 extracted_params: None,
                 detail: None,
+            },
+            Some((_, score)) => RouteOutcome {
+                utterance,
+                matched_workflow_id: None,
+                similarity_score: Some(score),
+                confirm_tier: None,
+                extracted_params: None,
+                detail: Some(format!(
+                    "best observed similarity {score} did not clear the {} match threshold",
+                    threshold::MATCH_THRESHOLD
+                )),
             },
             None => RouteOutcome {
                 utterance,
@@ -440,5 +510,175 @@ mod tests {
             Err(RouterError::Timeout { endpoint: "mock://ollama/api/embed".to_string(), seconds: 10 })
         );
         assert_eq!(client.call_count(), 2, "expected exactly two attempts, never a third");
+    }
+
+    // -----------------------------------------------------------------
+    // Task 2: threshold, refusal, and the edge contract
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn a_score_exactly_equal_to_the_match_threshold_clears_it() {
+        assert!(clears_threshold(threshold::MATCH_THRESHOLD, threshold::MATCH_THRESHOLD));
+    }
+
+    #[test]
+    fn a_score_one_f32_step_below_the_match_threshold_does_not_clear_it() {
+        let just_below = f32::from_bits(threshold::MATCH_THRESHOLD.to_bits() - 1);
+        assert!(!clears_threshold(just_below, threshold::MATCH_THRESHOLD));
+    }
+
+    #[test]
+    fn a_score_exactly_equal_to_the_confirm_required_threshold_clears_it() {
+        assert!(clears_threshold(
+            threshold::CONFIRM_REQUIRED_MATCH_THRESHOLD,
+            threshold::CONFIRM_REQUIRED_MATCH_THRESHOLD
+        ));
+    }
+
+    #[test]
+    fn a_score_one_f32_step_below_the_confirm_required_threshold_does_not_clear_it() {
+        let just_below = f32::from_bits(threshold::CONFIRM_REQUIRED_MATCH_THRESHOLD.to_bits() - 1);
+        assert!(!clears_threshold(just_below, threshold::CONFIRM_REQUIRED_MATCH_THRESHOLD));
+    }
+
+    #[tokio::test]
+    async fn no_candidate_clearing_the_threshold_refuses_and_never_names_the_runner_up() {
+        // A 3D utterance vector orthogonal to BOTH candidate vectors --
+        // cosine similarity is exactly 0.0 against each, well below
+        // MATCH_THRESHOLD, and still a finite/comparable score (never
+        // `None`), so this exercises the threshold-refusal branch, not the
+        // dimension-mismatch branch.
+        let mut vectors = HashMap::new();
+        vectors.insert("calendar intent".to_string(), vec![1.0, 0.0, 0.0]);
+        vectors.insert("timer intent".to_string(), vec![0.0, 1.0, 0.0]);
+        vectors.insert("orthogonal utterance".to_string(), vec![0.0, 0.0, 1.0]);
+        let client = Arc::new(MockOllama::new(vectors));
+        let router = Router::new(client, "nomic-embed-text");
+        let registry = registry_from(&[("aaa_wf", "calendar intent"), ("bbb_wf", "timer intent")]);
+
+        let outcome = router
+            .route("orthogonal utterance", &registry)
+            .await
+            .expect("route should succeed even when nothing clears the threshold");
+
+        assert_eq!(outcome.matched_workflow_id, None, "expected a refusal, never the runner-up id");
+        assert!(
+            outcome.detail.as_deref().is_some_and(|d| !d.contains("aaa_wf") && !d.contains("bbb_wf")),
+            "expected the refusal detail to name a score/threshold, never a candidate id, got: {:?}",
+            outcome.detail
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_or_whitespace_only_utterance_refuses_before_any_ollama_call() {
+        let client = Arc::new(MockOllama::new(two_workflow_vectors()));
+        let router = Router::new(client.clone(), "nomic-embed-text");
+        let registry =
+            registry_from(&[("calendar_today", calendar_intent()), ("set_timer", timer_intent())]);
+
+        let outcome = router.route("   ", &registry).await.expect("route should succeed (a refusal)");
+
+        assert_eq!(outcome.matched_workflow_id, None);
+        assert_eq!(client.call_count(), 0, "an empty utterance must never trigger an Ollama call");
+    }
+
+    #[tokio::test]
+    async fn an_utterance_over_the_max_char_limit_refuses_before_any_ollama_call() {
+        let client = Arc::new(MockOllama::new(HashMap::new()));
+        let router = Router::new(client.clone(), "nomic-embed-text");
+        let registry = registry_from(&[]);
+        let too_long: String = "a".repeat(threshold::MAX_UTTERANCE_CHARS + 1);
+
+        let outcome = router.route(&too_long, &registry).await.expect("route should succeed (a refusal)");
+
+        assert_eq!(outcome.matched_workflow_id, None);
+        assert_eq!(client.call_count(), 0, "an over-limit utterance must never trigger an Ollama call");
+    }
+
+    #[tokio::test]
+    async fn an_utterance_of_exactly_the_max_char_limit_is_accepted() {
+        let exactly_at_limit = "a".repeat(threshold::MAX_UTTERANCE_CHARS);
+        let mut vectors = HashMap::new();
+        vectors.insert(exactly_at_limit.clone(), vec![1.0, 0.0]);
+        let client = Arc::new(MockOllama::new(vectors));
+        let router = Router::new(client.clone(), "nomic-embed-text");
+        let registry = registry_from(&[]);
+
+        router.route(&exactly_at_limit, &registry).await.expect("route should succeed");
+
+        assert_eq!(
+            client.call_count(),
+            1,
+            "an utterance of exactly MAX_UTTERANCE_CHARS must be accepted, not refused"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dimension_mismatched_candidate_is_skipped_and_the_sole_candidate_case_refuses_not_errors() {
+        // The candidate's cached embedding is 3-dimensional; the utterance
+        // embedding the mock returns is 2-dimensional -- cosine_similarity
+        // must return None for this pair, never a panic or a comparison.
+        let mut vectors = HashMap::new();
+        vectors.insert("three dim intent".to_string(), vec![1.0, 0.0, 0.0]);
+        vectors.insert("two dim utterance".to_string(), vec![1.0, 0.0]);
+        let client = Arc::new(MockOllama::new(vectors));
+        let router = Router::new(client, "nomic-embed-text");
+        let registry = registry_from(&[("only_wf", "three dim intent")]);
+
+        let outcome = router
+            .route("two dim utterance", &registry)
+            .await
+            .expect("a dimension mismatch must refuse, never error");
+
+        assert_eq!(outcome.matched_workflow_id, None);
+    }
+
+    #[tokio::test]
+    async fn byte_identical_intents_score_identically_and_the_lexicographically_smaller_id_wins() {
+        let mut vectors = HashMap::new();
+        vectors.insert("identical intent text".to_string(), vec![1.0, 0.0]);
+        vectors.insert("identical intent text utterance".to_string(), vec![1.0, 0.0]);
+        let client = Arc::new(MockOllama::new(vectors));
+        let router = Router::new(client, "nomic-embed-text");
+        // "aaa_wf" sorts before "bbb_wf" in Registry::enumerate()'s id order.
+        let registry = registry_from(&[
+            ("bbb_wf", "identical intent text"),
+            ("aaa_wf", "identical intent text"),
+        ]);
+
+        let outcome = router
+            .route("identical intent text utterance", &registry)
+            .await
+            .expect("route should succeed");
+
+        assert_eq!(
+            outcome.matched_workflow_id,
+            Some("aaa_wf".to_string()),
+            "expected the lexicographically smaller id to win an exact score tie"
+        );
+    }
+
+    #[tokio::test]
+    async fn utterance_length_is_bounded_by_code_points_not_bytes() {
+        // Each "🎉" is 4 UTF-8 bytes but ONE Unicode scalar value -- 300 of
+        // them is 1200 bytes (over MAX_UTTERANCE_CHARS if measured in
+        // bytes) but only 300 code points (well under the limit).
+        let multi_byte_utterance: String = "🎉".repeat(300);
+        assert!(multi_byte_utterance.len() > threshold::MAX_UTTERANCE_CHARS);
+        assert!(multi_byte_utterance.chars().count() < threshold::MAX_UTTERANCE_CHARS);
+
+        let mut vectors = HashMap::new();
+        vectors.insert(multi_byte_utterance.clone(), vec![1.0, 0.0]);
+        let client = Arc::new(MockOllama::new(vectors));
+        let router = Router::new(client.clone(), "nomic-embed-text");
+        let registry = registry_from(&[]);
+
+        router.route(&multi_byte_utterance, &registry).await.expect("route should succeed");
+
+        assert_eq!(
+            client.call_count(),
+            1,
+            "expected a byte-long-but-code-point-short utterance to be accepted, not refused"
+        );
     }
 }
