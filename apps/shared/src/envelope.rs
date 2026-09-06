@@ -142,6 +142,28 @@ pub enum ProtocolFrame {
         found: bool,
         event: Option<ActivityEvent>,
     },
+    /// Plan 09-03 (D-02/D-03): client-to-daemon only, the dry-run
+    /// manual-trial surface for the embedding intent router. Sending this
+    /// frame never starts a run, mints a run id, or spends anything -- it
+    /// only asks "what would the router do with this utterance".
+    RouteUtterance { utterance: String },
+    /// The daemon's reply to `RouteUtterance` (D-02/D-03): a DRY-RUN report
+    /// which NEVER corresponds to a started run. `detail` carries the
+    /// refusal reason (no match, empty/over-length utterance) or the
+    /// degraded-router reason (router not configured, Ollama unreachable)
+    /// and is a normal reply, never an error and never a dropped
+    /// connection. `confirm_tier` carries one of the two snake_case strings
+    /// produced by the daemon's `ConfirmTier::as_wire_str()`
+    /// (`"route_freely"` / `"confirm_required"`), or `None` when nothing
+    /// matched.
+    RouteResult {
+        utterance: String,
+        matched_workflow_id: Option<String>,
+        similarity_score: Option<f32>,
+        confirm_tier: Option<String>,
+        extracted_params: Option<serde_json::Value>,
+        detail: Option<String>,
+    },
 }
 
 /// The payload of an `Envelope::Req`. `#[serde(untagged)]` wraps the
@@ -1018,6 +1040,82 @@ mod tests {
         let value = serde_json::to_value(&envelope).expect("serialize");
         assert_eq!(value["frame"]["found"], json!(false), "expected found == false, got: {value}");
         assert!(value["frame"]["event"].is_null(), "expected event to be null, got: {value}");
+    }
+
+    // ---- Plan 09-03 (D-02/D-03): RouteUtterance / RouteResult ----
+
+    #[test]
+    fn protocol_route_utterance_round_trips_and_carries_the_literal_tags() {
+        let envelope = Envelope::Protocol {
+            id: 5,
+            frame: ProtocolFrame::RouteUtterance {
+                utterance: "set a timer for ten minutes".to_string(),
+            },
+        };
+        assert_round_trips(&envelope);
+
+        let value = serde_json::to_value(&envelope).expect("serialize");
+        assert_eq!(value["type"], json!("protocol"), "expected type == \"protocol\", got: {value}");
+        assert_eq!(
+            value["frame"]["kind"],
+            json!("route_utterance"),
+            "expected frame.kind == \"route_utterance\", got: {value}"
+        );
+        assert_eq!(
+            value["frame"]["utterance"],
+            json!("set a timer for ten minutes"),
+            "expected the wrapped utterance to survive, got: {value}"
+        );
+    }
+
+    #[test]
+    fn protocol_route_result_round_trips_with_every_field_populated() {
+        let envelope = Envelope::Protocol {
+            id: 6,
+            frame: ProtocolFrame::RouteResult {
+                utterance: "set a timer for ten minutes".to_string(),
+                matched_workflow_id: Some("set_timer".to_string()),
+                similarity_score: Some(0.87),
+                confirm_tier: Some("route_freely".to_string()),
+                extracted_params: Some(json!({"duration_minutes": 10})),
+                detail: None,
+            },
+        };
+        assert_round_trips(&envelope);
+
+        let value = serde_json::to_value(&envelope).expect("serialize");
+        assert_eq!(
+            value["frame"]["kind"],
+            json!("route_result"),
+            "expected frame.kind == \"route_result\", got: {value}"
+        );
+        assert_eq!(value["frame"]["matched_workflow_id"], json!("set_timer"));
+        assert_eq!(value["frame"]["confirm_tier"], json!("route_freely"));
+    }
+
+    /// A `RouteResult` with every optional field absent still round-trips
+    /// (Task 1's own acceptance bar) -- the no-match/degraded-router shape.
+    #[test]
+    fn protocol_route_result_with_every_optional_field_absent_still_round_trips() {
+        let envelope = Envelope::Protocol {
+            id: 7,
+            frame: ProtocolFrame::RouteResult {
+                utterance: "book me a flight to Berlin".to_string(),
+                matched_workflow_id: None,
+                similarity_score: None,
+                confirm_tier: None,
+                extracted_params: None,
+                detail: Some("no candidate workflow matched".to_string()),
+            },
+        };
+        assert_round_trips(&envelope);
+
+        let value = serde_json::to_value(&envelope).expect("serialize");
+        assert!(value["frame"]["matched_workflow_id"].is_null());
+        assert!(value["frame"]["similarity_score"].is_null());
+        assert!(value["frame"]["confirm_tier"].is_null());
+        assert!(value["frame"]["extracted_params"].is_null());
+        assert_eq!(value["frame"]["detail"], json!("no candidate workflow matched"));
     }
 
     /// D-05 ordering guard: the new `Envelope::Protocol` variant must never

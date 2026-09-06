@@ -430,7 +430,7 @@ async fn dispatch_envelope(
         // handled-error, keep-serving treatment as every other stray-frame
         // arm above, never a dropped connection.
         Envelope::Protocol { id, frame } => {
-            handle_protocol_frame(id, frame, activity_registry, write, capabilities).await;
+            handle_protocol_frame(id, frame, orchestrator, activity_registry, write, capabilities).await;
         }
     }
 }
@@ -666,9 +666,15 @@ async fn send_res(write: &Arc<Mutex<WsWrite>>, id: u64, payload: ResponsePayload
 /// capabilities, which may differ from whatever the run's original owner
 /// declared -- before it is placed in the `RunDescription` reply. Recovery
 /// must never become a way around live filtering.
+///
+/// Plan 09-03 (D-02/D-03): `RouteUtterance` is the second client-to-daemon
+/// variant -- routed to the named `handle_route_utterance` helper below.
+/// `RouteResult` arriving FROM a client is server-push-only misuse (T-09-11),
+/// same graceful `UnexpectedFrameType` treatment as `Welcome`.
 async fn handle_protocol_frame(
     id: u64,
     frame: ProtocolFrame,
+    orchestrator: &Arc<InProcessOrchestrator>,
     activity_registry: &Arc<ActivityRegistry>,
     write: &Arc<Mutex<WsWrite>>,
     capabilities: &[String],
@@ -690,6 +696,9 @@ async fn handle_protocol_frame(
             )
             .await;
         }
+        ProtocolFrame::RouteUtterance { utterance } => {
+            handle_route_utterance(id, utterance, orchestrator, write).await;
+        }
         ProtocolFrame::Welcome { .. } => {
             let detail = ServerError::UnexpectedFrameType {
                 got: "protocol:welcome".to_string(),
@@ -704,7 +713,44 @@ async fn handle_protocol_frame(
             .to_string();
             send_error_res(write, id, detail).await;
         }
+        ProtocolFrame::RouteResult { .. } => {
+            let detail = ServerError::UnexpectedFrameType {
+                got: "protocol:route_result".to_string(),
+            }
+            .to_string();
+            send_error_res(write, id, detail).await;
+        }
     }
+}
+
+/// Answers `ProtocolFrame::RouteUtterance` (plan 09-03, D-02/D-03). The ONLY
+/// call this function makes is `orchestrator.route_utterance(...)` -- a
+/// read-only, dry-run trial surface that never dispatches, invokes, or
+/// enqueues a workflow run (T-09-02). Extracted into its own named,
+/// region-scoped function so this read-only guarantee is greppable in
+/// isolation (see `route_frame_integration.rs`'s source guard test), rather
+/// than merely stated in a comment.
+async fn handle_route_utterance(
+    id: u64,
+    utterance: String,
+    orchestrator: &Arc<InProcessOrchestrator>,
+    write: &Arc<Mutex<WsWrite>>,
+) {
+    let outcome = orchestrator.route_utterance(&utterance).await;
+    let confirm_tier = outcome.confirm_tier.map(|tier| tier.as_wire_str().to_string());
+    send_protocol(
+        write,
+        id,
+        ProtocolFrame::RouteResult {
+            utterance: outcome.utterance,
+            matched_workflow_id: outcome.matched_workflow_id,
+            similarity_score: outcome.similarity_score,
+            confirm_tier,
+            extracted_params: outcome.extracted_params,
+            detail: outcome.detail,
+        },
+    )
+    .await;
 }
 
 /// Encodes and writes an `Envelope::Protocol` (Phase 8, D-01/D-05). Built on

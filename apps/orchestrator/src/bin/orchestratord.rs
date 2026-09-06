@@ -87,6 +87,24 @@ struct Cli {
     /// are allocated inside (06-01/06-05).
     #[arg(long, env = "ORCHESTRATOR_AGENT_SCRATCH_DIR", default_value = "./data/agent-scratch")]
     agent_scratch_dir: PathBuf,
+
+    /// Base URL of the local Ollama server the router's HTTP client talks
+    /// to (plan 09-03, T-09-03). Resolved ONCE, here, at daemon startup from
+    /// this flag or its env var -- NEVER from any caller-supplied or
+    /// utterance-derived value, and never probed at startup: a daemon
+    /// started with no reachable Ollama still starts and still serves every
+    /// existing request type, answering `RouteUtterance` with a `detail`
+    /// naming the unreachable endpoint instead (mirrors `preflight_agent`'s
+    /// degrade-loudly-and-keep-starting pattern, but the router has no
+    /// preflight check at all -- degradation is per-request, not a startup
+    /// gate).
+    #[arg(long, env = "ORCHESTRATOR_OLLAMA_URL", default_value = "http://127.0.0.1:11434")]
+    ollama_url: String,
+
+    /// Ollama embedding model name the router embeds workflow `intent`
+    /// strings and incoming utterances with (plan 09-03, ROUT-01).
+    #[arg(long, env = "ORCHESTRATOR_EMBED_MODEL", default_value = "nomic-embed-text")]
+    embed_model: String,
 }
 
 /// How many days of on-disk activity history are rebuilt/retained across a
@@ -235,9 +253,24 @@ async fn main() -> std::io::Result<()> {
         }
     }
 
-    let orchestrator = Arc::new(InProcessOrchestrator::with_handlers(
+    // Router seam (plan 09-03, D-02/D-03): built once, here, from the
+    // resolved flags -- never probed against Ollama at startup (see the
+    // flags' own doc comments). Logged so a wrong resolved value is visible
+    // immediately, mirroring every other resolved-path startup log line in
+    // this function.
+    eprintln!(
+        "orchestratord: router resolved to Ollama base URL {:?} with embed model {:?}",
+        cli.ollama_url, cli.embed_model
+    );
+    let ollama_client: Arc<dyn orchestrator::router::ollama_client::OllamaApi> = Arc::new(
+        orchestrator::router::ollama_client::HttpOllamaClient::new(cli.ollama_url.clone()),
+    );
+    let router = Arc::new(orchestrator::router::Router::new(ollama_client, cli.embed_model.clone()));
+
+    let orchestrator = Arc::new(InProcessOrchestrator::with_router(
         &cli.workflows_dir,
         handlers,
+        router,
     ));
 
     // Loopback-only bind (T-04-05) -- the listener address is never derived

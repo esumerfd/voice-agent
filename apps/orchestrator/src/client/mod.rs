@@ -10,12 +10,14 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 
 use crate::dispatch::dispatch;
 use crate::registry::Registry;
 use crate::definition::ServiceMode;
+use crate::router::{RouteOutcome, Router};
 use crate::service::{RunStatus, Service};
 use shared::{
     CreateWorkflowRequest, CreateWorkflowResponse, DeleteWorkflowRequest, DeleteWorkflowResponse,
@@ -46,6 +48,12 @@ impl From<RunStatus> for InvokeStatus {
 pub struct InProcessOrchestrator {
     workflows_dir: PathBuf,
     handlers: HashMap<String, Box<dyn Service>>,
+    /// The router seam (plan 09-03, D-02): `None` unless the daemon was
+    /// constructed via `with_router` -- every existing call site
+    /// (`new`/`with_handlers`) defaults to `None` so they compile and behave
+    /// unchanged. `route_utterance` below is the ONLY method that reads
+    /// this field.
+    router: Option<Arc<Router>>,
 }
 
 impl InProcessOrchestrator {
@@ -53,6 +61,7 @@ impl InProcessOrchestrator {
         Self {
             workflows_dir: workflows_dir.into(),
             handlers: HashMap::new(),
+            router: None,
         }
     }
 
@@ -66,6 +75,64 @@ impl InProcessOrchestrator {
         Self {
             workflows_dir: workflows_dir.into(),
             handlers,
+            router: None,
+        }
+    }
+
+    /// Construct with both a handler registry AND the router seam (plan
+    /// 09-03, D-02): `orchestratord` calls this instead of `with_handlers`
+    /// once it has resolved `--ollama-url`/`--embed-model` and built a
+    /// `Router`. Mirrors `with_handlers`'s shape exactly.
+    pub fn with_router(
+        workflows_dir: impl Into<PathBuf>,
+        handlers: HashMap<String, Box<dyn Service>>,
+        router: Arc<Router>,
+    ) -> Self {
+        Self {
+            workflows_dir: workflows_dir.into(),
+            handlers,
+            router: Some(router),
+        }
+    }
+
+    /// Resolves `utterance` to a `RouteOutcome` (plan 09-03, D-02/D-03): the
+    /// dry-run manual-trial surface. Loads the registry with the same
+    /// per-request `Registry::load(&self.workflows_dir)` call every other
+    /// accessor here already uses, then calls `Router::route`. Returns a
+    /// `RouteOutcome`, never a `Result` -- both the `None`-router case and
+    /// every `RouterError` degrade into a `RouteOutcome` carrying
+    /// `matched_workflow_id: None` and a `detail` naming the cause, exactly
+    /// as a handler failure becomes `InvokeOutcome::Failed` rather than a
+    /// propagated panic in `dispatch()`. This is the ONLY path
+    /// `server::handle_route_utterance` reaches the router through -- it
+    /// never calls `Registry::load` or `router::Router` directly (D-03).
+    pub async fn route_utterance(&self, utterance: &str) -> RouteOutcome {
+        let Some(router) = &self.router else {
+            return RouteOutcome {
+                utterance: utterance.to_string(),
+                matched_workflow_id: None,
+                similarity_score: None,
+                confirm_tier: None,
+                extracted_params: None,
+                detail: Some(
+                    "the router is not configured on this daemon (no --ollama-url/--embed-model \
+                     resolved at startup)"
+                        .to_string(),
+                ),
+            };
+        };
+
+        let (registry, _errors) = Registry::load(&self.workflows_dir);
+        match router.route(utterance, &registry).await {
+            Ok(outcome) => outcome,
+            Err(err) => RouteOutcome {
+                utterance: utterance.to_string(),
+                matched_workflow_id: None,
+                similarity_score: None,
+                confirm_tier: None,
+                extracted_params: None,
+                detail: Some(err.to_string()),
+            },
         }
     }
 
