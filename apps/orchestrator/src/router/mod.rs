@@ -18,6 +18,7 @@
 //! unchanged).
 
 pub mod cache;
+pub mod confirm_tier;
 pub mod ollama_client;
 pub mod similarity;
 pub mod threshold;
@@ -25,6 +26,7 @@ pub mod threshold;
 use std::sync::Arc;
 
 use cache::EmbeddingCache;
+use confirm_tier::ConfirmTier;
 use ollama_client::{embed_with_retry, OllamaApi};
 use similarity::cosine_similarity;
 
@@ -39,11 +41,12 @@ pub struct RouteOutcome {
     pub utterance: String,
     pub matched_workflow_id: Option<String>,
     pub similarity_score: Option<f32>,
-    /// Left `None` in Task 1 -- Task 3 wires the fail-closed classifier in
-    /// (type becomes `Option<confirm_tier::ConfirmTier>` at that point;
-    /// `Option<String>` is a Task-1-only placeholder since `confirm_tier.rs`
-    /// does not exist until Task 3).
-    pub confirm_tier: Option<String>,
+    /// Fail-closed classification (Task 3, ROUT-04): `None` only when
+    /// `matched_workflow_id` is also `None` (nothing matched, so nothing to
+    /// classify). Populated BEFORE the threshold decision, so a
+    /// `ConfirmRequired` winner is checked against the stricter
+    /// `threshold::CONFIRM_REQUIRED_MATCH_THRESHOLD`, not the base one.
+    pub confirm_tier: Option<ConfirmTier>,
     /// Left `None` in Task 1 and Task 2 -- plan 09-04 fills this in.
     pub extracted_params: Option<serde_json::Value>,
     /// A human-readable refusal reason. Never names the runner-up
@@ -211,35 +214,54 @@ impl Router {
         }
         drop(cache);
 
-        // Threshold applied at the end of the scan, never mid-loop: the
-        // winning candidate is reported only when its score is `>=`
-        // `MATCH_THRESHOLD` (inclusive at the boundary -- an exact match
-        // matches, one representable f32 step below refuses). Task 3 wires
-        // in the stricter `CONFIRM_REQUIRED_MATCH_THRESHOLD` for a
-        // `ConfirmRequired`-tier winner. Below the bar, the refusal names
-        // the best observed score and the threshold it failed -- never the
+        // Threshold applied at the end of the scan, never mid-loop, and
+        // classification happens BEFORE the threshold decision so the
+        // correct bar is applied: a `ConfirmRequired` winner must clear the
+        // stricter `CONFIRM_REQUIRED_MATCH_THRESHOLD`; every other winner
+        // clears the base `MATCH_THRESHOLD`. Both bars are inclusive at the
+        // boundary (an exact match matches, one representable f32 step
+        // below refuses). Below the bar, the refusal names the best
+        // observed score and the threshold it failed -- never the
         // runner-up id, so no caller can mistake a refusal for a weak
         // suggestion.
         Ok(match best {
-            Some((id, score)) if clears_threshold(score, threshold::MATCH_THRESHOLD) => RouteOutcome {
-                utterance,
-                matched_workflow_id: Some(id),
-                similarity_score: Some(score),
-                confirm_tier: None,
-                extracted_params: None,
-                detail: None,
-            },
-            Some((_, score)) => RouteOutcome {
-                utterance,
-                matched_workflow_id: None,
-                similarity_score: Some(score),
-                confirm_tier: None,
-                extracted_params: None,
-                detail: Some(format!(
-                    "best observed similarity {score} did not clear the {} match threshold",
-                    threshold::MATCH_THRESHOLD
-                )),
-            },
+            Some((id, score)) => {
+                // `id` was produced by `registry.lookup` earlier in THIS
+                // same call, against this SAME immutable `&Registry` --
+                // guaranteed present, never a network- or caller-derived
+                // value, so `.expect()` here documents an internal
+                // invariant rather than tolerating an external failure.
+                let def = registry
+                    .lookup(&id)
+                    .expect("a candidate id produced by this same route() call must still resolve");
+                let tier = confirm_tier::confirm_tier(def);
+                let required_threshold = match tier {
+                    ConfirmTier::ConfirmRequired => threshold::CONFIRM_REQUIRED_MATCH_THRESHOLD,
+                    ConfirmTier::RouteFreely => threshold::MATCH_THRESHOLD,
+                };
+
+                if clears_threshold(score, required_threshold) {
+                    RouteOutcome {
+                        utterance,
+                        matched_workflow_id: Some(id),
+                        similarity_score: Some(score),
+                        confirm_tier: Some(tier),
+                        extracted_params: None,
+                        detail: None,
+                    }
+                } else {
+                    RouteOutcome {
+                        utterance,
+                        matched_workflow_id: None,
+                        similarity_score: Some(score),
+                        confirm_tier: None,
+                        extracted_params: None,
+                        detail: Some(format!(
+                            "best observed similarity {score} did not clear the {required_threshold} match threshold"
+                        )),
+                    }
+                }
+            }
             None => RouteOutcome {
                 utterance,
                 matched_workflow_id: None,
