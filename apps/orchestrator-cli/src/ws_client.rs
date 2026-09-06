@@ -45,6 +45,13 @@ pub struct WsOrchestratorClient {
     /// Pending `ProtocolFrame` calls (plan 09-03, `call_protocol`) --
     /// SEPARATE from `pending` above even though both share `next_id`, so a
     /// `Res` and a `Protocol` reply can never contend for the same slot.
+    /// `#[allow(dead_code)]`: `ws_client.rs` is `#[path]`-included
+    /// independently into every integration test binary (there is no
+    /// `[lib]` target for this crate); only `route_integration.rs` and the
+    /// real `[[bin]]` (via `route.rs`) call `call_protocol`, so every OTHER
+    /// test binary's own separate compilation of this file sees this field
+    /// as unread, mirroring `events` below's identical situation.
+    #[allow(dead_code)]
     pending_protocol: Arc<Mutex<HashMap<u64, oneshot::Sender<ProtocolFrame>>>>,
     next_id: AtomicU64,
     /// Reserved `Event` frames (D-03) forwarded here by the read loop rather
@@ -199,6 +206,12 @@ impl WsOrchestratorClient {
     /// encode or send failure, removes the pending entry and returns `Err`
     /// naming the failure -- never a panic, matching `call`'s
     /// `failure_payload` discipline.
+    ///
+    /// `#[allow(dead_code)]`: only `route_integration.rs` and the real
+    /// `[[bin]]` (via `route.rs`) call this -- every other test binary's own
+    /// separate `#[path]`-included compilation of this file never calls it,
+    /// same reasoning as `pending_protocol`'s field-level allow above.
+    #[allow(dead_code)]
     pub async fn call_protocol(&self, frame: ProtocolFrame) -> Result<ProtocolFrame, String> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();

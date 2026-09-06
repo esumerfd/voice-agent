@@ -60,6 +60,21 @@ intent: "set a countdown timer"
 Timer fixture.
 "#;
 
+/// The one `service.type: agent` fixture (Task 3, D-03): the case that
+/// would cost real money (`ai_summarize`'s real Claude spend) if the
+/// dry-run guarantee ever failed.
+const AGENT_WORKFLOW: &str = r#"---
+id: ai_summarize
+name: AI Summarize
+parameters: {}
+service:
+  type: agent
+  handler: agent.claude
+intent: "summarize a document using an AI agent"
+---
+AI summarize fixture (agent-type -- confirm_required, D-03).
+"#;
+
 fn write_workflow(dir: &Path, filename: &str, contents: &str) {
     let path = dir.join(filename);
     if let Some(parent) = path.parent() {
@@ -71,6 +86,7 @@ fn write_workflow(dir: &Path, filename: &str, contents: &str) {
 fn write_fixture_workflows(dir: &Path) {
     write_workflow(dir, "calendar_today.md", CALENDAR_WORKFLOW);
     write_workflow(dir, "set_timer.md", TIMER_WORKFLOW);
+    write_workflow(dir, "ai_summarize.md", AGENT_WORKFLOW);
 }
 
 /// Deterministic stub `OllamaApi` -- these tests need no live Ollama server.
@@ -90,6 +106,10 @@ impl StubOllama {
             embed_calls: AtomicUsize::new(0),
         }
     }
+
+    fn embed_call_count(&self) -> usize {
+        self.embed_calls.load(Ordering::SeqCst)
+    }
 }
 
 #[async_trait]
@@ -107,7 +127,15 @@ fn distinguishable_vectors() -> HashMap<String, Vec<f32>> {
     let mut v = HashMap::new();
     v.insert("check today's calendar events".to_string(), vec![1.0, 0.0, 0.0]);
     v.insert("set a countdown timer".to_string(), vec![0.0, 1.0, 0.0]);
+    v.insert(
+        "summarize a document using an AI agent".to_string(),
+        vec![0.0, 0.0, 1.0],
+    );
     v.insert("what's on my calendar today".to_string(), vec![0.9, 0.1, 0.0]);
+    v.insert(
+        "please summarize this document for me".to_string(),
+        vec![0.05, 0.0, 0.95],
+    );
     v
 }
 
@@ -119,7 +147,11 @@ fn stub_router(vectors: HashMap<String, Vec<f32>>) -> Arc<Router> {
 /// Spawns an in-process daemon over `workflows_dir`. `router: None` mirrors
 /// a daemon that never resolved the router flags at all -- exercises the
 /// "router not configured" degrade path (Task 1's own behaviour bullet).
-async fn spawn_server(workflows_dir: &Path, router: Option<Arc<Router>>) -> u16 {
+/// Returns the bound port AND the `Arc<ActivityRegistry>` the daemon was
+/// built with (Task 3): the dispatch-prohibition tests snapshot this
+/// directly, rather than trusting the wire reply alone, since D-03's
+/// guarantee is about real daemon state, not just what the reply claims.
+async fn spawn_server(workflows_dir: &Path, router: Option<Arc<Router>>) -> (u16, Arc<ActivityRegistry>) {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("failed to bind an ephemeral loopback port");
@@ -133,8 +165,12 @@ async fn spawn_server(workflows_dir: &Path, router: Option<Arc<Router>>) -> u16 
         None => Arc::new(InProcessOrchestrator::with_handlers(workflows_dir, handlers)),
     };
     let activity_registry = Arc::new(ActivityRegistry::new());
-    tokio::spawn(orchestrator::server::serve(listener, orchestrator, activity_registry));
-    port
+    tokio::spawn(orchestrator::server::serve(
+        listener,
+        orchestrator,
+        Arc::clone(&activity_registry),
+    ));
+    (port, activity_registry)
 }
 
 async fn connect(port: u16) -> WsStream {
@@ -189,7 +225,7 @@ async fn route_utterance_frame_correlates_to_route_result_by_the_same_id() {
     let dir = TempDir::new().expect("failed to create tempdir");
     write_fixture_workflows(dir.path());
     let router = stub_router(distinguishable_vectors());
-    let port = spawn_server(dir.path(), Some(router)).await;
+    let (port, _activity_registry) = spawn_server(dir.path(), Some(router)).await;
 
     let mut ws = connect(port).await;
     hello(&mut ws, "orchestrator-cli").await;
@@ -221,7 +257,7 @@ async fn a_matching_utterance_returns_the_expected_workflow_and_a_similarity_sco
     let dir = TempDir::new().expect("failed to create tempdir");
     write_fixture_workflows(dir.path());
     let router = stub_router(distinguishable_vectors());
-    let port = spawn_server(dir.path(), Some(router)).await;
+    let (port, _activity_registry) = spawn_server(dir.path(), Some(router)).await;
 
     let mut ws = connect(port).await;
     hello(&mut ws, "orchestrator-cli").await;
@@ -261,7 +297,7 @@ async fn an_utterance_that_matches_nothing_returns_a_normal_reply_with_a_detail(
     let dir = TempDir::new().expect("failed to create tempdir");
     write_fixture_workflows(dir.path());
     let router = stub_router(distinguishable_vectors());
-    let port = spawn_server(dir.path(), Some(router)).await;
+    let (port, _activity_registry) = spawn_server(dir.path(), Some(router)).await;
 
     let mut ws = connect(port).await;
     hello(&mut ws, "orchestrator-cli").await;
@@ -303,7 +339,7 @@ async fn an_utterance_that_matches_nothing_returns_a_normal_reply_with_a_detail(
 async fn a_daemon_without_a_router_configured_answers_with_a_detail_naming_that() {
     let dir = TempDir::new().expect("failed to create tempdir");
     write_fixture_workflows(dir.path());
-    let port = spawn_server(dir.path(), None).await;
+    let (port, _activity_registry) = spawn_server(dir.path(), None).await;
 
     let mut ws = connect(port).await;
     hello(&mut ws, "orchestrator-cli").await;
@@ -355,7 +391,7 @@ async fn a_daemon_with_unreachable_ollama_replies_with_a_detail_and_keeps_the_co
     let base_url = format!("http://127.0.0.1:{closed_port}");
     let client: Arc<dyn OllamaApi> = Arc::new(HttpOllamaClient::new(base_url));
     let router = Arc::new(Router::new(client, "nomic-embed-text"));
-    let port = spawn_server(dir.path(), Some(router)).await;
+    let (port, _activity_registry) = spawn_server(dir.path(), Some(router)).await;
 
     let mut ws = connect(port).await;
     hello(&mut ws, "orchestrator-cli").await;
@@ -411,5 +447,282 @@ async fn a_daemon_with_unreachable_ollama_replies_with_a_detail_and_keeps_the_co
         other => panic!(
             "expected the connection to survive an unreachable-Ollama RouteUtterance, got: {other:?}"
         ),
+    }
+}
+
+// -----------------------------------------------------------------
+// Task 3: prove the trial surface cannot dispatch, and bound it at the wire
+// (D-03). The strongest available assertion is behavioural: capture
+// `ActivityRegistry::snapshot()` before and after routing an agent-type
+// match -- a started run always appears there, so an unchanged snapshot
+// proves nothing was started. See `server/mod.rs::handle_route_utterance`
+// for the accompanying region-scoped source guard.
+// -----------------------------------------------------------------
+
+async fn route_agent_match(ws: &mut WsStream, id: u64) -> ProtocolFrame {
+    send(
+        ws,
+        &Envelope::Protocol {
+            id,
+            frame: ProtocolFrame::RouteUtterance {
+                utterance: "please summarize this document for me".to_string(),
+            },
+        },
+    )
+    .await;
+    match recv(ws).await {
+        Envelope::Protocol { frame, .. } => frame,
+        other => panic!("expected Envelope::Protocol(RouteResult), got: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn routing_an_agent_type_match_leaves_the_activity_snapshot_byte_identical() {
+    let dir = TempDir::new().expect("failed to create tempdir");
+    write_fixture_workflows(dir.path());
+    let router = stub_router(distinguishable_vectors());
+    let (port, activity_registry) = spawn_server(dir.path(), Some(router)).await;
+
+    let mut ws = connect(port).await;
+    hello(&mut ws, "orchestrator-cli").await;
+
+    let before = activity_registry.snapshot();
+    assert!(before.is_empty(), "expected an empty snapshot before any route call, got: {before:?}");
+
+    let frame = route_agent_match(&mut ws, 1).await;
+    match &frame {
+        ProtocolFrame::RouteResult { matched_workflow_id, .. } => {
+            assert_eq!(
+                matched_workflow_id.as_deref(),
+                Some("ai_summarize"),
+                "expected the agent-type workflow to be matched, got: {frame:?}"
+            );
+        }
+        other => panic!("expected Envelope::Protocol(RouteResult), got: {other:?}"),
+    }
+
+    let after = activity_registry.snapshot();
+    // `ActivityEvent` derives no `PartialEq` -- compare via serialized JSON
+    // (byte-identical in length and content) instead of adding a derive to
+    // a shared struct outside this plan's file scope.
+    let before_json = serde_json::to_value(&before).expect("serialize before snapshot");
+    let after_json = serde_json::to_value(&after).expect("serialize after snapshot");
+    assert_eq!(
+        before_json, after_json,
+        "expected the activity snapshot to be byte-identical in length and content after routing \
+         an agent-type match -- a started run always appears here, so an unchanged snapshot proves \
+         nothing was started (D-03)"
+    );
+    assert!(after.is_empty(), "expected the snapshot to still be empty, got: {after:?}");
+}
+
+#[tokio::test]
+async fn an_agent_type_match_returns_confirm_required_and_carries_no_run_id() {
+    let dir = TempDir::new().expect("failed to create tempdir");
+    write_fixture_workflows(dir.path());
+    let router = stub_router(distinguishable_vectors());
+    let (port, _activity_registry) = spawn_server(dir.path(), Some(router)).await;
+
+    let mut ws = connect(port).await;
+    hello(&mut ws, "orchestrator-cli").await;
+
+    let frame = route_agent_match(&mut ws, 1).await;
+    match &frame {
+        ProtocolFrame::RouteResult { confirm_tier, .. } => {
+            assert_eq!(
+                confirm_tier.as_deref(),
+                Some("confirm_required"),
+                "expected the agent-type match to carry the confirm_required tier, got: {frame:?}"
+            );
+        }
+        other => panic!("expected Envelope::Protocol(RouteResult), got: {other:?}"),
+    }
+
+    // `RouteResult` has no `run_id` field at all (unlike `InvokeWorkflowResponse`
+    // or the `Started` ack) -- structurally, not just by omission, it can
+    // never carry one. Serialize to JSON as a defensive belt-and-braces
+    // check against a future accidental field addition.
+    let value = serde_json::to_value(&frame).expect("serialize RouteResult");
+    assert!(
+        value.get("run_id").is_none(),
+        "expected no run_id key anywhere in the RouteResult reply, got: {value}"
+    );
+}
+
+#[tokio::test]
+async fn routing_the_same_agent_utterance_twenty_times_never_accumulates_activity_state() {
+    let dir = TempDir::new().expect("failed to create tempdir");
+    write_fixture_workflows(dir.path());
+    let router = stub_router(distinguishable_vectors());
+    let (port, activity_registry) = spawn_server(dir.path(), Some(router)).await;
+
+    let mut ws = connect(port).await;
+    hello(&mut ws, "orchestrator-cli").await;
+
+    for i in 0..20 {
+        let frame = route_agent_match(&mut ws, i).await;
+        match &frame {
+            ProtocolFrame::RouteResult { matched_workflow_id, .. } => {
+                assert_eq!(matched_workflow_id.as_deref(), Some("ai_summarize"));
+            }
+            other => panic!("expected Envelope::Protocol(RouteResult) on iteration {i}, got: {other:?}"),
+        }
+    }
+
+    let after = activity_registry.snapshot();
+    assert!(
+        after.is_empty(),
+        "expected the activity snapshot to remain empty after 20 consecutive routes of an \
+         agent-type match -- no path may accumulate state, got: {after:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_client_sent_route_result_is_rejected_and_the_connection_survives_for_a_subsequent_route() {
+    let dir = TempDir::new().expect("failed to create tempdir");
+    write_fixture_workflows(dir.path());
+    let router = stub_router(distinguishable_vectors());
+    let (port, _activity_registry) = spawn_server(dir.path(), Some(router)).await;
+
+    let mut ws = connect(port).await;
+    hello(&mut ws, "orchestrator-cli").await;
+
+    // A `RouteResult` is server-push-only -- a client sending one is a
+    // protocol misuse, matching every other server-push-only arm's
+    // treatment (T-09-11).
+    send(
+        &mut ws,
+        &Envelope::Protocol {
+            id: 1,
+            frame: ProtocolFrame::RouteResult {
+                utterance: "forged".to_string(),
+                matched_workflow_id: None,
+                similarity_score: None,
+                confirm_tier: None,
+                extracted_params: None,
+                detail: None,
+            },
+        },
+    )
+    .await;
+
+    match recv(&mut ws).await {
+        Envelope::Res {
+            payload: ResponsePayload::InvokeWorkflow(resp),
+            ..
+        } => {
+            let error = resp.error.expect("expected an error detail on the rejection reply");
+            assert!(
+                error.to_lowercase().contains("unexpected") && error.contains("route_result"),
+                "expected an UnexpectedFrameType error naming route_result, got: {error:?}"
+            );
+        }
+        other => panic!("expected a graceful error Res, got: {other:?}"),
+    }
+
+    // The connection must survive: a subsequent, legitimate RouteUtterance
+    // still succeeds on the SAME connection.
+    let frame = route_agent_match(&mut ws, 2).await;
+    match frame {
+        ProtocolFrame::RouteResult { matched_workflow_id, .. } => {
+            assert_eq!(
+                matched_workflow_id.as_deref(),
+                Some("ai_summarize"),
+                "expected the connection to still serve a legitimate RouteUtterance after the rejection"
+            );
+        }
+        other => panic!("expected Envelope::Protocol(RouteResult), got: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn an_over_length_utterance_names_the_limit_and_costs_zero_embed_calls() {
+    let dir = TempDir::new().expect("failed to create tempdir");
+    write_fixture_workflows(dir.path());
+    let stub = Arc::new(StubOllama::new(HashMap::new()));
+    let client: Arc<dyn OllamaApi> = stub.clone();
+    let router = Arc::new(Router::new(client, "nomic-embed-text"));
+    let (port, _activity_registry) = spawn_server(dir.path(), Some(router)).await;
+
+    let mut ws = connect(port).await;
+    hello(&mut ws, "orchestrator-cli").await;
+
+    let too_long = "a".repeat(orchestrator::router::threshold::MAX_UTTERANCE_CHARS + 1);
+    send(
+        &mut ws,
+        &Envelope::Protocol {
+            id: 1,
+            frame: ProtocolFrame::RouteUtterance { utterance: too_long },
+        },
+    )
+    .await;
+
+    match recv(&mut ws).await {
+        Envelope::Protocol {
+            frame:
+                ProtocolFrame::RouteResult {
+                    matched_workflow_id,
+                    detail,
+                    ..
+                },
+            ..
+        } => {
+            assert_eq!(matched_workflow_id, None);
+            let detail = detail.expect("expected a detail naming the character limit");
+            assert!(
+                detail.contains(&orchestrator::router::threshold::MAX_UTTERANCE_CHARS.to_string()),
+                "expected the detail to name the {}-code-point limit, got: {detail:?}",
+                orchestrator::router::threshold::MAX_UTTERANCE_CHARS
+            );
+        }
+        other => panic!("expected Envelope::Protocol(RouteResult), got: {other:?}"),
+    }
+
+    assert_eq!(
+        stub.embed_call_count(),
+        0,
+        "expected an over-length utterance to be refused before any Ollama embed call"
+    );
+}
+
+#[tokio::test]
+async fn an_empty_utterance_names_that_it_was_empty() {
+    let dir = TempDir::new().expect("failed to create tempdir");
+    write_fixture_workflows(dir.path());
+    let router = stub_router(distinguishable_vectors());
+    let (port, _activity_registry) = spawn_server(dir.path(), Some(router)).await;
+
+    let mut ws = connect(port).await;
+    hello(&mut ws, "orchestrator-cli").await;
+
+    send(
+        &mut ws,
+        &Envelope::Protocol {
+            id: 1,
+            frame: ProtocolFrame::RouteUtterance {
+                utterance: String::new(),
+            },
+        },
+    )
+    .await;
+
+    match recv(&mut ws).await {
+        Envelope::Protocol {
+            frame:
+                ProtocolFrame::RouteResult {
+                    matched_workflow_id,
+                    detail,
+                    ..
+                },
+            ..
+        } => {
+            assert_eq!(matched_workflow_id, None);
+            let detail = detail.expect("expected a detail naming the empty utterance");
+            assert!(
+                detail.to_lowercase().contains("empty"),
+                "expected the detail to name that the utterance was empty, got: {detail:?}"
+            );
+        }
+        other => panic!("expected Envelope::Protocol(RouteResult), got: {other:?}"),
     }
 }
