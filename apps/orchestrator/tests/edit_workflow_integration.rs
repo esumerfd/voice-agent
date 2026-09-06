@@ -211,6 +211,7 @@ async fn connect(port: u16) -> WsStream {
         .expect("failed to connect to the in-process WS server");
     let hello = Envelope::Hello {
         client_name: "edit_workflow_integration_test".to_string(),
+        capabilities: Vec::new(),
     };
     send(&mut ws, &hello).await;
     ws

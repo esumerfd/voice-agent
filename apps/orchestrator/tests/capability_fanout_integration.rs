@@ -25,8 +25,8 @@ use shared::ProtocolFrame;
 
 use orchestrator::activity::ActivityRegistry;
 use orchestrator::{
-    Envelope, InProcessOrchestrator, InvokeStatus, InvokeWorkflowRequest, RequestPayload,
-    ResponsePayload, RunHandle, RunStatus, Service, ServiceError,
+    Envelope, InProcessOrchestrator, InvokeStatus, InvokeWorkflowRequest, ListWorkflowsRequest,
+    RequestPayload, ResponsePayload, RunHandle, RunStatus, Service, ServiceError,
 };
 
 type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -398,4 +398,259 @@ async fn describe_run_recovery_for_a_reconnecting_client_declaring_speech_carrie
         }
         other => panic!("expected Envelope::Protocol(RunDescription), got: {other:?}"),
     }
+}
+
+/// Task 3 (D-03) adversarial guard: privilege-escalation-by-self-report. A
+/// bystander that declares the speech capability, but did NOT start the
+/// run, must never receive an addressed terminal Event for it -- a
+/// declaration only ever widens rendering for a connection's OWN runs, it
+/// never grants addressing of someone else's. The bystander DOES still see
+/// the run's shared Activity lifecycle, proving the guard narrows
+/// addressing rather than silencing the feed.
+#[tokio::test]
+async fn a_bystander_declaring_speech_cannot_address_a_run_it_did_not_start() {
+    let dir = TempDir::new().expect("failed to create tempdir");
+    write_workflow(dir.path(), "speak_it.md", SPEECH_WORKFLOW);
+    let port = spawn_server(dir.path(), speech_handlers()).await;
+
+    // The OWNER here declares NOTHING; the bystander declares speech.
+    let mut owner = connect(port).await;
+    hello(&mut owner, "orchestrator-cli", Vec::new()).await;
+    let mut bystander = connect(port).await;
+    hello(&mut bystander, "voice-front-end", vec![shared::CAPABILITY_SPEECH.to_string()]).await;
+
+    send(&mut owner, &invoke_speak_it(1)).await;
+    let run_id = match recv_res(&mut owner).await {
+        Envelope::Res {
+            payload: ResponsePayload::InvokeWorkflow(resp),
+            ..
+        } => resp.run_id.expect("expected a Some(run_id) on the Started ack"),
+        other => panic!("expected a Started ack, got: {other:?}"),
+    };
+
+    // The bystander still sees the run's shared Activity lifecycle reach a
+    // terminal phase...
+    let bystander_activity = tokio::time::timeout(
+        Duration::from_secs(5),
+        recv_terminal_activity_for(&mut bystander, &run_id),
+    )
+    .await
+    .expect("expected the bystander to see the run's Activity lifecycle reach a terminal phase");
+    assert_eq!(bystander_activity.run_id, run_id);
+
+    // ...but never receives an addressed terminal Event for it, despite
+    // declaring the speech capability.
+    let bystander_saw_no_event = tokio::time::timeout(Duration::from_millis(500), async {
+        loop {
+            if let Envelope::Event { .. } = recv(&mut bystander).await {
+                return true;
+            }
+        }
+    })
+    .await
+    .is_err();
+    assert!(
+        bystander_saw_no_event,
+        "expected a bystander declaring speech but not owning the run to receive no Envelope::Event"
+    );
+}
+
+/// Task 3 (D-03) adversarial guard: owner-gone. The run's owner disconnects
+/// before the run terminates; a second, still-connected bystander must still
+/// see the run's terminal Activity frame (never an Event), the daemon must
+/// still be serving (a subsequent request on the bystander's own connection
+/// is answered), and a fresh connection must still be able to recover the
+/// run through DescribeRun.
+#[tokio::test]
+async fn owner_disconnecting_before_terminal_leaves_the_daemon_serving_and_the_run_recoverable() {
+    let dir = TempDir::new().expect("failed to create tempdir");
+    write_workflow(dir.path(), "speak_it.md", SPEECH_WORKFLOW);
+    let port = spawn_server(dir.path(), speech_handlers()).await;
+
+    let mut owner = connect(port).await;
+    hello(&mut owner, "voice-front-end", vec![shared::CAPABILITY_SPEECH.to_string()]).await;
+    let mut bystander = connect(port).await;
+    hello(&mut bystander, "orchestrator-tui", Vec::new()).await;
+
+    send(&mut owner, &invoke_speak_it(1)).await;
+    let run_id = match recv_res(&mut owner).await {
+        Envelope::Res {
+            payload: ResponsePayload::InvokeWorkflow(resp),
+            ..
+        } => resp.run_id.expect("expected a Some(run_id) on the Started ack"),
+        other => panic!("expected a Started ack, got: {other:?}"),
+    };
+
+    // Drop the owner before the run reaches a terminal state.
+    drop(owner);
+
+    // The still-connected bystander sees the run's terminal Activity frame
+    // (never an Event -- it never owned this run either).
+    let bystander_activity = tokio::time::timeout(
+        Duration::from_secs(5),
+        recv_terminal_activity_for(&mut bystander, &run_id),
+    )
+    .await
+    .expect("expected the surviving bystander to see the run's terminal Activity frame");
+    assert_eq!(bystander_activity.run_id, run_id);
+
+    // The daemon is still serving: a subsequent request on the bystander's
+    // own connection is answered.
+    send(
+        &mut bystander,
+        &Envelope::Req {
+            id: 99,
+            payload: RequestPayload::ListWorkflows(ListWorkflowsRequest {}),
+        },
+    )
+    .await;
+    match recv_res(&mut bystander).await {
+        Envelope::Res {
+            id,
+            payload: ResponsePayload::ListWorkflows(_),
+        } => assert_eq!(id, 99, "expected the daemon to still answer a request after the owner disconnected"),
+        other => panic!("expected a ListWorkflows Res, got: {other:?}"),
+    }
+
+    // A fresh connection can still recover the run through DescribeRun.
+    let mut fresh = connect(port).await;
+    hello(&mut fresh, "orchestrator-cli", Vec::new()).await;
+    send(
+        &mut fresh,
+        &Envelope::Protocol {
+            id: 1,
+            frame: ProtocolFrame::DescribeRun { run_id: run_id.clone() },
+        },
+    )
+    .await;
+    match recv_protocol(&mut fresh).await {
+        Envelope::Protocol {
+            frame: ProtocolFrame::RunDescription { found, run_id: got_run_id, .. },
+            ..
+        } => {
+            assert!(found, "expected the disconnected owner's run to still be recoverable");
+            assert_eq!(got_run_id, run_id);
+        }
+        other => panic!("expected Envelope::Protocol(RunDescription), got: {other:?}"),
+    }
+}
+
+/// Task 3 (T-08-12) capability bounding: a Hello declaring more entries than
+/// `MAX_CAPABILITIES`, or one whose single entry exceeds
+/// `MAX_CAPABILITY_LEN`, each leave the connection fully functional (a
+/// subsequent request is answered) and each behave as an empty declaration
+/// -- the connection receives no gated field in a subsequent run's Activity
+/// detail.
+#[tokio::test]
+async fn oversized_capability_declarations_degrade_to_empty_but_stay_functional() {
+    let dir = TempDir::new().expect("failed to create tempdir");
+    write_workflow(dir.path(), "speak_it.md", SPEECH_WORKFLOW);
+    let port = spawn_server(dir.path(), speech_handlers()).await;
+
+    // Over-count: more than MAX_CAPABILITIES (16) entries.
+    let too_many: Vec<String> = (0..20).map(|n| format!("cap-{n}")).collect();
+    let mut over_count = connect(port).await;
+    hello(&mut over_count, "over-count-client", too_many).await;
+
+    // Over-length: a single entry longer than MAX_CAPABILITY_LEN (64).
+    let too_long = vec!["x".repeat(200)];
+    let mut over_length = connect(port).await;
+    hello(&mut over_length, "over-length-client", too_long).await;
+
+    for (label, ws) in [("over_count", &mut over_count), ("over_length", &mut over_length)] {
+        // The connection stays functional: a request is answered.
+        send(
+            ws,
+            &Envelope::Req {
+                id: 7,
+                payload: RequestPayload::ListWorkflows(ListWorkflowsRequest {}),
+            },
+        )
+        .await;
+        match recv_res(ws).await {
+            Envelope::Res {
+                id,
+                payload: ResponsePayload::ListWorkflows(_),
+            } => assert_eq!(id, 7, "expected {label} connection to still answer a request"),
+            other => panic!("expected a ListWorkflows Res for {label}, got: {other:?}"),
+        }
+    }
+
+    // Each degraded declaration behaves as empty: invoking the gated-field
+    // workflow from the over-count connection yields no gated field in its
+    // own terminal event.
+    send(&mut over_count, &invoke_speak_it(8)).await;
+    let owner_event = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Envelope::Event {
+                payload: ResponsePayload::InvokeWorkflow(resp),
+                ..
+            } = recv(&mut over_count).await
+            {
+                return resp;
+            }
+        }
+    })
+    .await
+    .expect("expected the over-count connection to receive its own terminal event");
+    let output = owner_event.output.expect("expected Some(output)");
+    assert!(
+        output.get("speech").is_none(),
+        "expected an over-count capability declaration to degrade to empty (no gated field), got: {output:?}"
+    );
+}
+
+/// Task 3 (D-03/D-04) backward compatibility: a raw Hello JSON literal with
+/// no `capabilities` key at all -- every client built before this phase --
+/// leaves the connection functional and gated-field-free.
+#[tokio::test]
+async fn hello_with_no_capabilities_key_at_all_is_functional_and_gated_field_free() {
+    let dir = TempDir::new().expect("failed to create tempdir");
+    write_workflow(dir.path(), "speak_it.md", SPEECH_WORKFLOW);
+    let port = spawn_server(dir.path(), speech_handlers()).await;
+
+    let mut ws = connect(port).await;
+    let raw_hello = json!({"type": "hello", "client_name": "pre-phase-8-client"});
+    ws.send(Message::text(raw_hello.to_string()))
+        .await
+        .expect("failed to send a raw capabilities-less Hello literal");
+
+    // Functional: a request is answered.
+    send(
+        &mut ws,
+        &Envelope::Req {
+            id: 5,
+            payload: RequestPayload::ListWorkflows(ListWorkflowsRequest {}),
+        },
+    )
+    .await;
+    match recv_res(&mut ws).await {
+        Envelope::Res {
+            id,
+            payload: ResponsePayload::ListWorkflows(_),
+        } => assert_eq!(id, 5, "expected a capabilities-less Hello to leave the connection functional"),
+        other => panic!("expected a ListWorkflows Res, got: {other:?}"),
+    }
+
+    // Gated-field-free: invoking the gated-field workflow yields no gated
+    // key in this connection's own terminal event.
+    send(&mut ws, &invoke_speak_it(6)).await;
+    let event = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Envelope::Event {
+                payload: ResponsePayload::InvokeWorkflow(resp),
+                ..
+            } = recv(&mut ws).await
+            {
+                return resp;
+            }
+        }
+    })
+    .await
+    .expect("expected the connection to receive its own terminal event");
+    let output = event.output.expect("expected Some(output)");
+    assert!(
+        output.get("speech").is_none(),
+        "expected a capabilities-less pre-Phase-8 Hello to be served with no gated field, got: {output:?}"
+    );
 }

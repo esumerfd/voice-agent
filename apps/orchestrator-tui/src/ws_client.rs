@@ -72,8 +72,13 @@ impl TuiWsClient {
         // discipline as `call` (never `.unwrap()`) -- a failure here is a
         // handled no-op, not a panic; the connection simply proceeds
         // unidentified (server-side degrades to "unknown", Pitfall 3).
+        // Phase 8 (D-03/D-04): `orchestrator-tui` declares NO capabilities
+        // in this phase -- it renders exclusively from ungated fields.
+        // Phase 11's voice front end is the first client that will declare
+        // one (e.g. `"speech"`).
         let hello = Envelope::Hello {
             client_name: CLIENT_NAME.to_string(),
+            capabilities: Vec::new(),
         };
         if let Ok(text) = serde_json::to_string(&hello) {
             let mut guard = write.lock().await;

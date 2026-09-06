@@ -69,7 +69,7 @@ async fn client_sends_hello_first_then_receives_pushed_activity_event() {
         let envelope: Envelope =
             serde_json::from_str(text).expect("first frame should decode as a valid Envelope");
         let client_name = match envelope {
-            Envelope::Hello { client_name } => client_name,
+            Envelope::Hello { client_name, .. } => client_name,
             other => panic!("expected Hello as the first frame, got: {other:?}"),
         };
 

@@ -142,6 +142,7 @@ async fn hello_sets_identity_and_the_connection_still_answers_requests() {
         &mut ws,
         &Envelope::Hello {
             client_name: "orchestrator-tui".to_string(),
+            capabilities: Vec::new(),
         },
     )
     .await;
@@ -176,6 +177,7 @@ async fn oversized_hello_does_not_crash_the_daemon_and_the_connection_stays_func
         &mut ws,
         &Envelope::Hello {
             client_name: huge_name,
+            capabilities: Vec::new(),
         },
     )
     .await;
