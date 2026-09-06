@@ -155,6 +155,20 @@ mod tests {
             self.call_count.fetch_add(1, Ordering::SeqCst);
             Ok(inputs.iter().map(|s| vec![s.len() as f32]).collect())
         }
+
+        // Plan 09-04 (ROUT-03) added `generate_json` to `OllamaApi` --
+        // `cache.rs`'s tests exercise `EmbeddingCache` directly, never
+        // structured extraction, so this stub exists only to satisfy the
+        // trait and is never called by any test in this file.
+        async fn generate_json(
+            &self,
+            _model: &str,
+            _system: &str,
+            _prompt: &str,
+            _schema: &serde_json::Value,
+        ) -> Result<serde_json::Value, RouterError> {
+            unimplemented!("CountingClient only exercises EmbeddingCache::sync, never structured extraction")
+        }
     }
 
     fn pair(id: &str, intent: &str) -> (String, String) {

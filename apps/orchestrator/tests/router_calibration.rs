@@ -58,6 +58,9 @@ const OLLAMA_BASE_URL: &str = "http://127.0.0.1:11434";
 /// Matches `orchestratord`'s own `--embed-model` default.
 const EMBED_MODEL: &str = "nomic-embed-text";
 
+/// Matches `orchestratord`'s own `--extract-model` default (plan 09-04).
+const EXTRACT_MODEL: &str = "llama3.2:3b";
+
 /// Loads the real, committed `workflows/` directory -- the same resolution
 /// `registry_integration.rs`/`confirm_tier.rs`'s real-workflow test use.
 fn real_registry() -> Registry {
@@ -183,7 +186,7 @@ async fn every_known_positive_utterance_routes_to_its_expected_workflow_against_
 
     let registry = real_registry();
     let client: Arc<dyn OllamaApi> = Arc::new(HttpOllamaClient::new(OLLAMA_BASE_URL));
-    let router = Router::new(client, EMBED_MODEL);
+    let router = Router::new(client, EMBED_MODEL, EXTRACT_MODEL);
 
     // Route through the FULL pipeline (thresholds, tie-break, cache sync,
     // refusal logic), never `cosine_similarity` directly -- the same run

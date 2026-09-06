@@ -91,6 +91,21 @@ impl OllamaApi for StubOllama {
             .map(|i| self.vectors.get(i).cloned().unwrap_or_default())
             .collect())
     }
+
+    // Plan 09-04 (ROUT-03) added `generate_json` to `OllamaApi`. Every
+    // fixture workflow this file routes to declares zero parameters, so
+    // `Router::extract_params`'s zero-parameter short-circuit means this
+    // method is never actually called by any test in this file -- it exists
+    // only to satisfy the trait.
+    async fn generate_json(
+        &self,
+        _model: &str,
+        _system: &str,
+        _prompt: &str,
+        _schema: &serde_json::Value,
+    ) -> Result<serde_json::Value, RouterError> {
+        Ok(serde_json::json!({}))
+    }
 }
 
 fn distinguishable_vectors() -> HashMap<String, Vec<f32>> {
@@ -110,7 +125,7 @@ fn distinguishable_vectors() -> HashMap<String, Vec<f32>> {
 
 fn stub_router(vectors: HashMap<String, Vec<f32>>) -> Arc<Router> {
     let client: Arc<dyn OllamaApi> = Arc::new(StubOllama::new(vectors));
-    Arc::new(Router::new(client, "nomic-embed-text"))
+    Arc::new(Router::new(client, "nomic-embed-text", "llama3.2:3b"))
 }
 
 /// Binds an ephemeral loopback WS server in-process (never a spawned

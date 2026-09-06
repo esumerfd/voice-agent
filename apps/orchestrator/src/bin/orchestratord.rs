@@ -265,7 +265,14 @@ async fn main() -> std::io::Result<()> {
     let ollama_client: Arc<dyn orchestrator::router::ollama_client::OllamaApi> = Arc::new(
         orchestrator::router::ollama_client::HttpOllamaClient::new(cli.ollama_url.clone()),
     );
-    let router = Arc::new(orchestrator::router::Router::new(ollama_client, cli.embed_model.clone()));
+    let router = Arc::new(orchestrator::router::Router::new(
+        ollama_client,
+        cli.embed_model.clone(),
+        // TODO(plan 09-04 Task 3): replace this literal with a resolved
+        // `--extract-model`/`ORCHESTRATOR_EXTRACT_MODEL` flag, mirroring
+        // `--embed-model`'s own shape exactly.
+        "llama3.2:3b",
+    ));
 
     let orchestrator = Arc::new(InProcessOrchestrator::with_router(
         &cli.workflows_dir,

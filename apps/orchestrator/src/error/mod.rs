@@ -110,6 +110,20 @@ pub enum RouterError {
         expected: usize,
         got: usize,
     },
+
+    /// Extraction-specific degradation (plan 09-04, ROUT-03): a matched
+    /// workflow's structured-parameter extraction failed for ANY reason (an
+    /// unreachable/erroring Ollama call, a non-object response, or a
+    /// `validate_payload` failure against the workflow's own
+    /// `ParameterSpec`). `workflow_id` names the ALREADY-MATCHED workflow
+    /// the extraction was scoped to -- never the runner-up, never another
+    /// workflow. This variant is NEVER propagated as an `Err` out of
+    /// `Router::route` -- a failed extraction must never invalidate a
+    /// successful match (ROUT-04 boundary) -- it exists only to give
+    /// `Router::extract_params` one consistently-formatted `Display` string
+    /// to fold into `RouteOutcome.detail`.
+    #[error("parameter extraction for workflow `{workflow_id}` was rejected: {detail}")]
+    ExtractionRejected { workflow_id: String, detail: String },
 }
 
 /// Payload-validation failures (D-07): a JSON payload checked against a

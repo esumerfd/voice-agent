@@ -20,6 +20,7 @@
 pub mod cache;
 pub mod confirm_tier;
 pub mod ollama_client;
+pub mod schema;
 pub mod similarity;
 pub mod threshold;
 
@@ -30,6 +31,7 @@ use confirm_tier::ConfirmTier;
 use ollama_client::{embed_with_retry, OllamaApi};
 use similarity::cosine_similarity;
 
+use crate::definition::WorkflowDefinition;
 use crate::error::RouterError;
 use crate::registry::Registry;
 
@@ -47,11 +49,18 @@ pub struct RouteOutcome {
     /// `ConfirmRequired` winner is checked against the stricter
     /// `threshold::CONFIRM_REQUIRED_MATCH_THRESHOLD`, not the base one.
     pub confirm_tier: Option<ConfirmTier>,
-    /// Left `None` in Task 1 and Task 2 -- plan 09-04 fills this in.
+    /// `Some` on a successful extraction (including the zero-parameter
+    /// short-circuit, which reports an empty object) -- `None` when nothing
+    /// matched OR when extraction failed for any reason (plan 09-04,
+    /// ROUT-03). A failed extraction never invalidates a successful match:
+    /// `matched_workflow_id`/`similarity_score`/`confirm_tier` are set
+    /// identically whether or not extraction succeeded.
     pub extracted_params: Option<serde_json::Value>,
-    /// A human-readable refusal reason. Never names the runner-up
-    /// workflow id -- a refusal must never be mistaken for a weak
-    /// suggestion.
+    /// A human-readable refusal/degradation reason. Never names the
+    /// runner-up workflow id on a routing refusal -- a refusal must never
+    /// be mistaken for a weak suggestion. May be `Some` alongside a
+    /// successful match when extraction itself degraded (plan 09-04) --
+    /// that is not a routing refusal, only an extraction one.
     pub detail: Option<String>,
 }
 
@@ -71,6 +80,11 @@ pub struct Router {
     /// the reason lives here rather than at each call site.
     cache: tokio::sync::Mutex<EmbeddingCache>,
     embed_model: String,
+    /// The Ollama instruct model `extract_params` calls (plan 09-04,
+    /// ROUT-03) -- deliberately a SEPARATE model/field from `embed_model`:
+    /// embedding and structured generation are different Ollama endpoints
+    /// with different model requirements.
+    extract_model: String,
     /// Test-only observability hook: the `SyncStats` computed by this
     /// router's most recent cache sync, so a test can assert D-06's
     /// contract (recomputed/reused/evicted counts) through a real `route`
@@ -90,11 +104,16 @@ fn clears_threshold(score: f32, required: f32) -> bool {
 }
 
 impl Router {
-    pub fn new(client: Arc<dyn OllamaApi>, embed_model: impl Into<String>) -> Self {
+    pub fn new(
+        client: Arc<dyn OllamaApi>,
+        embed_model: impl Into<String>,
+        extract_model: impl Into<String>,
+    ) -> Self {
         Self {
             client,
             cache: tokio::sync::Mutex::new(EmbeddingCache::new()),
             embed_model: embed_model.into(),
+            extract_model: extract_model.into(),
             #[cfg(test)]
             last_sync: tokio::sync::Mutex::new(cache::SyncStats::default()),
         }
@@ -103,6 +122,87 @@ impl Router {
     #[cfg(test)]
     async fn last_sync_stats(&self) -> cache::SyncStats {
         *self.last_sync.lock().await
+    }
+
+    /// Fills `def`'s declared parameters from `utterance` via the instruct
+    /// model (ROUT-03, plan 09-04). The schema is built from `def.parameters`
+    /// ALONE -- never the registry, never any other workflow's parameters or
+    /// intent (T-09-01/T-09-14): the similarity match has already selected
+    /// `def`, independently of this call, so an instruction hidden inside
+    /// `utterance` can at worst distort the VALUES extracted for `def`; it
+    /// can never retarget which workflow's schema is even built. The fixed
+    /// instruction text travels in the `system` field and `utterance` alone
+    /// travels in `prompt` (as a JSON-encoded string value) -- structurally
+    /// separate request fields, a stronger injection boundary than
+    /// delimiting the two inside one concatenated string.
+    ///
+    /// A workflow with zero declared parameters short-circuits here without
+    /// ever touching `self.client` -- two of the four shipped workflows
+    /// declare no parameters, so this is the common case, and an
+    /// instruct-model call for it would cost roughly a second of latency to
+    /// produce a guaranteed empty object.
+    ///
+    /// NEVER returns an error to the caller: every extraction-specific
+    /// failure (an unreachable/erroring Ollama call, a non-object result, or
+    /// a `validate_payload` failure against `def.parameters`) degrades to
+    /// `(None, Some(detail))` rather than propagating -- a failed extraction
+    /// must never invalidate the match `route()` already decided (ROUT-04
+    /// boundary). `detail` is always built from `RouterError::
+    /// ExtractionRejected`'s `Display` impl, so every failure path names the
+    /// offending workflow id in one consistently-worded string.
+    async fn extract_params(
+        &self,
+        def: &WorkflowDefinition,
+        utterance: &str,
+    ) -> (Option<serde_json::Value>, Option<String>) {
+        if def.parameters.is_empty() {
+            return (Some(serde_json::Value::Object(serde_json::Map::new())), None);
+        }
+
+        let param_schema = schema::build_param_schema(&def.parameters);
+        let system = format!(
+            "You extract structured parameters for the \"{}\" workflow from a user's \
+             utterance. Respond with ONLY a JSON object matching the given schema -- never \
+             invent a parameter the schema does not declare, and never respond on behalf of \
+             any other workflow.",
+            def.id
+        );
+        // The untrusted utterance travels as a JSON-encoded STRING value in
+        // `prompt`, never as free instruction text -- the schema (not the
+        // prose) is what actually constrains the model's output.
+        let prompt = format!("Utterance: {}", serde_json::Value::String(utterance.to_string()));
+
+        let raw = match self.client.generate_json(&self.extract_model, &system, &prompt, &param_schema).await {
+            Ok(value) => value,
+            Err(e) => {
+                let rejected =
+                    RouterError::ExtractionRejected { workflow_id: def.id.clone(), detail: e.to_string() };
+                return (None, Some(rejected.to_string()));
+            }
+        };
+
+        let Some(object) = raw.as_object() else {
+            let rejected = RouterError::ExtractionRejected {
+                workflow_id: def.id.clone(),
+                detail: "the model's response parsed to a non-object JSON value".to_string(),
+            };
+            return (None, Some(rejected.to_string()));
+        };
+
+        // The router extracting a value does not exempt it from the
+        // workflow's declared type checks: the SAME unconditional gate
+        // `dispatch()` applies on the real invocation path (V5 input
+        // validation) -- never reported as if it had passed.
+        match crate::dispatch::validate_payload(object, &def.parameters) {
+            Ok(()) => (Some(raw), None),
+            Err(e) => {
+                let rejected = RouterError::ExtractionRejected {
+                    workflow_id: def.id.clone(),
+                    detail: format!("validation failed: {e}"),
+                };
+                (None, Some(rejected.to_string()))
+            }
+        }
     }
 
     /// Resolves `utterance` to the nearest-intent workflow in `registry`
@@ -241,13 +341,19 @@ impl Router {
                 };
 
                 if clears_threshold(score, required_threshold) {
+                    // Extraction runs ONLY after the match and the
+                    // confirmation tier are already decided (plan 09-04) --
+                    // whatever `extract_params` returns can never change
+                    // `matched_workflow_id`/`similarity_score`/`confirm_tier`
+                    // below, only `extracted_params`/`detail`.
+                    let (extracted_params, extraction_detail) = self.extract_params(def, &utterance).await;
                     RouteOutcome {
                         utterance,
                         matched_workflow_id: Some(id),
                         similarity_score: Some(score),
                         confirm_tier: Some(tier),
-                        extracted_params: None,
-                        detail: None,
+                        extracted_params,
+                        detail: extraction_detail,
                     }
                 } else {
                     RouteOutcome {
@@ -286,10 +392,27 @@ mod tests {
     /// `MockAgentRuntime`'s shape (canned outcome + call counter + optional
     /// forced error/behavior). Every `embed()` call is a SINGLE attempt --
     /// `embed_with_retry` (the production call site) supplies the retry.
+    ///
+    /// Plan 09-04 extends this SAME mock with `generate_json` support
+    /// (a canned response string + its own call counter + a recorded-request
+    /// log) rather than introducing a second mock type -- one `OllamaApi`
+    /// double across the whole module, exactly like the trait it mirrors.
     struct MockOllama {
         vectors: HashMap<String, Vec<f32>>,
         call_count: AtomicUsize,
         behavior: MockBehavior,
+        /// The canned JSON-encoded string `generate_json` parses and
+        /// returns. Defaults to an empty object so every pre-existing
+        /// routing test (which never configures this) exercises the
+        /// zero-parameter short-circuit and never actually reaches this
+        /// value.
+        generate_response: String,
+        generate_call_count: AtomicUsize,
+        /// Every `generate_json` call's `(model, system, prompt, schema)`
+        /// tuple, in call order -- lets a test assert on the EXACT request
+        /// shape (e.g. byte-identical repeated calls), not just the return
+        /// value.
+        generate_requests: std::sync::Mutex<Vec<(String, String, String, serde_json::Value)>>,
     }
 
     enum MockBehavior {
@@ -306,15 +429,51 @@ mod tests {
 
     impl MockOllama {
         fn new(vectors: HashMap<String, Vec<f32>>) -> Self {
-            Self { vectors, call_count: AtomicUsize::new(0), behavior: MockBehavior::Normal }
+            Self {
+                vectors,
+                call_count: AtomicUsize::new(0),
+                behavior: MockBehavior::Normal,
+                generate_response: "{}".to_string(),
+                generate_call_count: AtomicUsize::new(0),
+                generate_requests: std::sync::Mutex::new(Vec::new()),
+            }
         }
 
         fn with_behavior(vectors: HashMap<String, Vec<f32>>, behavior: MockBehavior) -> Self {
-            Self { vectors, call_count: AtomicUsize::new(0), behavior }
+            Self {
+                vectors,
+                call_count: AtomicUsize::new(0),
+                behavior,
+                generate_response: "{}".to_string(),
+                generate_call_count: AtomicUsize::new(0),
+                generate_requests: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        /// A mock configured with a canned `generate_json` response string
+        /// (plan 09-04, Task 1). `vectors` still drives `embed()` exactly as
+        /// every other constructor here.
+        fn with_generate_response(vectors: HashMap<String, Vec<f32>>, generate_response: &str) -> Self {
+            Self {
+                vectors,
+                call_count: AtomicUsize::new(0),
+                behavior: MockBehavior::Normal,
+                generate_response: generate_response.to_string(),
+                generate_call_count: AtomicUsize::new(0),
+                generate_requests: std::sync::Mutex::new(Vec::new()),
+            }
         }
 
         fn call_count(&self) -> usize {
             self.call_count.load(Ordering::SeqCst)
+        }
+
+        fn generate_call_count(&self) -> usize {
+            self.generate_call_count.load(Ordering::SeqCst)
+        }
+
+        fn generate_requests(&self) -> Vec<(String, String, String, serde_json::Value)> {
+            self.generate_requests.lock().expect("mock mutex poisoned").clone()
         }
     }
 
@@ -337,6 +496,26 @@ mod tests {
                 }),
                 _ => Ok(inputs.iter().map(|i| self.vectors.get(i).cloned().unwrap_or_default()).collect()),
             }
+        }
+
+        async fn generate_json(
+            &self,
+            model: &str,
+            system: &str,
+            prompt: &str,
+            schema: &serde_json::Value,
+        ) -> Result<serde_json::Value, RouterError> {
+            self.generate_call_count.fetch_add(1, Ordering::SeqCst);
+            self.generate_requests.lock().expect("mock mutex poisoned").push((
+                model.to_string(),
+                system.to_string(),
+                prompt.to_string(),
+                schema.clone(),
+            ));
+            serde_json::from_str(&self.generate_response).map_err(|e| RouterError::MalformedResponse {
+                endpoint: "mock://ollama/api/generate".to_string(),
+                detail: e.to_string(),
+            })
         }
     }
 
@@ -381,7 +560,7 @@ mod tests {
         let mut vectors = two_workflow_vectors();
         vectors.insert("check my calendar".to_string(), vec![0.9, 0.1, 0.0]);
         let client = Arc::new(MockOllama::new(vectors));
-        let router = Router::new(client, "nomic-embed-text");
+        let router = Router::new(client, "nomic-embed-text", "llama3.2:3b");
         let registry = registry_from(&[
             ("calendar_today", calendar_intent()),
             ("set_timer", timer_intent()),
@@ -399,7 +578,7 @@ mod tests {
         let mut vectors = two_workflow_vectors();
         vectors.insert("check my calendar".to_string(), vec![0.9, 0.1, 0.0]);
         let client = Arc::new(MockOllama::new(vectors));
-        let router = Router::new(client.clone(), "nomic-embed-text");
+        let router = Router::new(client.clone(), "nomic-embed-text", "llama3.2:3b");
         let registry = registry_from(&[
             ("calendar_today", calendar_intent()),
             ("set_timer", timer_intent()),
@@ -426,7 +605,7 @@ mod tests {
         vectors.insert("changed intent text".to_string(), vec![0.0, 0.0, 1.0]);
         vectors.insert("check my calendar".to_string(), vec![0.9, 0.1, 0.0]);
         let client = Arc::new(MockOllama::new(vectors));
-        let router = Router::new(client, "nomic-embed-text");
+        let router = Router::new(client, "nomic-embed-text", "llama3.2:3b");
 
         let registry = registry_from(&[
             ("calendar_today", calendar_intent()),
@@ -448,7 +627,7 @@ mod tests {
         let mut vectors = two_workflow_vectors();
         vectors.insert("set a timer please".to_string(), vec![0.1, 0.9, 0.0]);
         let client = Arc::new(MockOllama::new(vectors));
-        let router = Router::new(client, "nomic-embed-text");
+        let router = Router::new(client, "nomic-embed-text", "llama3.2:3b");
 
         let registry = registry_from(&[
             ("calendar_today", calendar_intent()),
@@ -476,7 +655,7 @@ mod tests {
         vectors.insert(calendar_intent().to_string(), vec![1.0, 0.0]);
         vectors.insert("something".to_string(), vec![0.9, 0.1]);
         let client = Arc::new(MockOllama::new(vectors));
-        let router = Router::new(client, "nomic-embed-text");
+        let router = Router::new(client, "nomic-embed-text", "llama3.2:3b");
 
         let registry = registry_from(&[("calendar_today", calendar_intent()), ("empty_intent_wf", "")]);
 
@@ -489,7 +668,7 @@ mod tests {
     #[tokio::test]
     async fn a_connection_error_surfaces_as_ollama_unreachable_and_never_panics() {
         let client = Arc::new(MockOllama::with_behavior(HashMap::new(), MockBehavior::Unreachable));
-        let router = Router::new(client.clone(), "nomic-embed-text");
+        let router = Router::new(client.clone(), "nomic-embed-text", "llama3.2:3b");
         // No candidates -- isolates the assertion to the utterance embed call.
         let registry = registry_from(&[]);
 
@@ -510,7 +689,7 @@ mod tests {
         let mut vectors = HashMap::new();
         vectors.insert("anything".to_string(), vec![1.0, 0.0]);
         let client = Arc::new(MockOllama::with_behavior(vectors, MockBehavior::TimeoutThenSucceed));
-        let router = Router::new(client.clone(), "nomic-embed-text");
+        let router = Router::new(client.clone(), "nomic-embed-text", "llama3.2:3b");
         let registry = registry_from(&[]);
 
         let result = router.route("anything", &registry).await;
@@ -522,7 +701,7 @@ mod tests {
     #[tokio::test]
     async fn a_timeout_on_both_attempts_fails_after_exactly_two_attempts_never_a_third() {
         let client = Arc::new(MockOllama::with_behavior(HashMap::new(), MockBehavior::AlwaysTimeout));
-        let router = Router::new(client.clone(), "nomic-embed-text");
+        let router = Router::new(client.clone(), "nomic-embed-text", "llama3.2:3b");
         let registry = registry_from(&[]);
 
         let result = router.route("anything", &registry).await;
@@ -575,7 +754,7 @@ mod tests {
         vectors.insert("timer intent".to_string(), vec![0.0, 1.0, 0.0]);
         vectors.insert("orthogonal utterance".to_string(), vec![0.0, 0.0, 1.0]);
         let client = Arc::new(MockOllama::new(vectors));
-        let router = Router::new(client, "nomic-embed-text");
+        let router = Router::new(client, "nomic-embed-text", "llama3.2:3b");
         let registry = registry_from(&[("aaa_wf", "calendar intent"), ("bbb_wf", "timer intent")]);
 
         let outcome = router
@@ -594,7 +773,7 @@ mod tests {
     #[tokio::test]
     async fn an_empty_or_whitespace_only_utterance_refuses_before_any_ollama_call() {
         let client = Arc::new(MockOllama::new(two_workflow_vectors()));
-        let router = Router::new(client.clone(), "nomic-embed-text");
+        let router = Router::new(client.clone(), "nomic-embed-text", "llama3.2:3b");
         let registry =
             registry_from(&[("calendar_today", calendar_intent()), ("set_timer", timer_intent())]);
 
@@ -607,7 +786,7 @@ mod tests {
     #[tokio::test]
     async fn an_utterance_over_the_max_char_limit_refuses_before_any_ollama_call() {
         let client = Arc::new(MockOllama::new(HashMap::new()));
-        let router = Router::new(client.clone(), "nomic-embed-text");
+        let router = Router::new(client.clone(), "nomic-embed-text", "llama3.2:3b");
         let registry = registry_from(&[]);
         let too_long: String = "a".repeat(threshold::MAX_UTTERANCE_CHARS + 1);
 
@@ -623,7 +802,7 @@ mod tests {
         let mut vectors = HashMap::new();
         vectors.insert(exactly_at_limit.clone(), vec![1.0, 0.0]);
         let client = Arc::new(MockOllama::new(vectors));
-        let router = Router::new(client.clone(), "nomic-embed-text");
+        let router = Router::new(client.clone(), "nomic-embed-text", "llama3.2:3b");
         let registry = registry_from(&[]);
 
         router.route(&exactly_at_limit, &registry).await.expect("route should succeed");
@@ -644,7 +823,7 @@ mod tests {
         vectors.insert("three dim intent".to_string(), vec![1.0, 0.0, 0.0]);
         vectors.insert("two dim utterance".to_string(), vec![1.0, 0.0]);
         let client = Arc::new(MockOllama::new(vectors));
-        let router = Router::new(client, "nomic-embed-text");
+        let router = Router::new(client, "nomic-embed-text", "llama3.2:3b");
         let registry = registry_from(&[("only_wf", "three dim intent")]);
 
         let outcome = router
@@ -661,7 +840,7 @@ mod tests {
         vectors.insert("identical intent text".to_string(), vec![1.0, 0.0]);
         vectors.insert("identical intent text utterance".to_string(), vec![1.0, 0.0]);
         let client = Arc::new(MockOllama::new(vectors));
-        let router = Router::new(client, "nomic-embed-text");
+        let router = Router::new(client, "nomic-embed-text", "llama3.2:3b");
         // "aaa_wf" sorts before "bbb_wf" in Registry::enumerate()'s id order.
         let registry = registry_from(&[
             ("bbb_wf", "identical intent text"),
@@ -692,7 +871,7 @@ mod tests {
         let mut vectors = HashMap::new();
         vectors.insert(multi_byte_utterance.clone(), vec![1.0, 0.0]);
         let client = Arc::new(MockOllama::new(vectors));
-        let router = Router::new(client.clone(), "nomic-embed-text");
+        let router = Router::new(client.clone(), "nomic-embed-text", "llama3.2:3b");
         let registry = registry_from(&[]);
 
         router.route(&multi_byte_utterance, &registry).await.expect("route should succeed");
@@ -702,5 +881,145 @@ mod tests {
             1,
             "expected a byte-long-but-code-point-short utterance to be accepted, not refused"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Plan 09-04, Task 1: structured parameter extraction, happy path
+    // -----------------------------------------------------------------
+
+    /// A `WorkflowDefinition` with one required int parameter, constructed
+    /// directly via struct literal (every field on `WorkflowDefinition`/
+    /// `ServiceSpec` is `pub`, and this test module is inside the SAME
+    /// crate) -- unlike `Registry`, `WorkflowDefinition` carries no
+    /// plan-level construction restriction.
+    fn timer_definition() -> WorkflowDefinition {
+        let mut parameters = HashMap::new();
+        parameters.insert(
+            "duration_minutes".to_string(),
+            crate::definition::ParameterSpec {
+                type_: crate::definition::ParameterType::Int,
+                description: Some("how many minutes".to_string()),
+                required: true,
+            },
+        );
+        WorkflowDefinition {
+            id: "set_timer".to_string(),
+            name: "Set Timer".to_string(),
+            description: String::new(),
+            parameters,
+            service: crate::definition::ServiceSpec {
+                type_: Some("action".to_string()),
+                handler: "timers.start".to_string(),
+                mode: crate::definition::ServiceMode::Sync,
+                command: None,
+                args: Vec::new(),
+                agent: None,
+            },
+            source_path: std::path::PathBuf::from("stub.md"),
+            intent: timer_intent().to_string(),
+            triggers: Vec::new(),
+        }
+    }
+
+    /// Same fixture-writer shape as `registry_from`, but with a real
+    /// `parameters:` block -- `registry_from` hardcodes `parameters: {{}}`,
+    /// which cannot express `set_timer`'s required int parameter.
+    fn registry_with_timer_workflow() -> Registry {
+        let dir = tempfile::TempDir::new().expect("failed to create fixture tempdir");
+        let contents = format!(
+            "---\nid: set_timer\nname: Set Timer\nparameters:\n  duration_minutes:\n    type: int\n    required: true\nservice:\n  type: action\n  handler: timers.start\nintent: {:?}\n---\nStub timer workflow for extraction tests.\n",
+            timer_intent()
+        );
+        std::fs::write(dir.path().join("set_timer.md"), contents).expect("failed to write workflow fixture");
+        let (registry, errors) = Registry::load(dir.path());
+        assert!(errors.is_empty(), "expected zero load errors from the fixture directory, got: {errors:?}");
+        registry
+    }
+
+    #[tokio::test]
+    async fn a_matched_utterance_returns_typed_extracted_parameters_from_the_double_parsed_response() {
+        let mut vectors = HashMap::new();
+        vectors.insert(timer_intent().to_string(), vec![0.0, 1.0, 0.0]);
+        vectors.insert("set a timer for ten minutes".to_string(), vec![0.0, 1.0, 0.0]);
+        let mock =
+            Arc::new(MockOllama::with_generate_response(vectors, r#"{"duration_minutes": 10}"#));
+        let router = Router::new(mock.clone(), "nomic-embed-text", "llama3.2:3b");
+        let registry = registry_with_timer_workflow();
+
+        let outcome = router
+            .route("set a timer for ten minutes", &registry)
+            .await
+            .expect("route should succeed");
+
+        assert_eq!(outcome.matched_workflow_id, Some("set_timer".to_string()));
+        assert_eq!(outcome.confirm_tier, Some(ConfirmTier::RouteFreely));
+        assert_eq!(
+            outcome.extracted_params,
+            Some(serde_json::json!({"duration_minutes": 10})),
+            "expected the double-parsed response value, typed, on the outcome"
+        );
+        assert_eq!(mock.generate_call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_schema_handed_to_the_model_names_exactly_the_matched_workflows_parameters() {
+        let mut vectors = HashMap::new();
+        vectors.insert(timer_intent().to_string(), vec![0.0, 1.0, 0.0]);
+        vectors.insert("set a timer for ten minutes".to_string(), vec![0.0, 1.0, 0.0]);
+        let mock =
+            Arc::new(MockOllama::with_generate_response(vectors, r#"{"duration_minutes": 10}"#));
+        let router = Router::new(mock.clone(), "nomic-embed-text", "llama3.2:3b");
+        let registry = registry_with_timer_workflow();
+
+        router.route("set a timer for ten minutes", &registry).await.expect("route should succeed");
+
+        let requests = mock.generate_requests();
+        assert_eq!(requests.len(), 1);
+        let schema = &requests[0].3;
+        let properties: Vec<&str> =
+            schema["properties"].as_object().expect("properties must be an object").keys().map(|s| s.as_str()).collect();
+        assert_eq!(
+            properties,
+            vec!["duration_minutes"],
+            "expected the schema to name exactly the matched workflow's own parameters, no others"
+        );
+    }
+
+    #[tokio::test]
+    async fn extract_params_produces_byte_identical_requests_across_repeated_calls() {
+        let mock =
+            Arc::new(MockOllama::with_generate_response(HashMap::new(), r#"{"duration_minutes": 10}"#));
+        let router = Router::new(mock.clone(), "nomic-embed-text", "llama3.2:3b");
+        let def = timer_definition();
+
+        router.extract_params(&def, "set a timer for ten minutes").await;
+        router.extract_params(&def, "set a timer for ten minutes").await;
+
+        let requests = mock.generate_requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[0], requests[1],
+            "expected byte-identical (model, system, prompt, schema) requests across repeated \
+             calls with the same input"
+        );
+    }
+
+    #[tokio::test]
+    async fn extract_params_never_reads_the_registry_and_only_ever_sees_the_one_matched_definition() {
+        // Threat model gate (T-09-01/T-09-14): `extract_params` takes a
+        // single `&WorkflowDefinition`, never a `&Registry` -- there is
+        // nothing for it to enumerate even if it tried. This test exercises
+        // the call directly against a bare definition with no registry in
+        // scope at all, proving the function's own signature is the
+        // enforcement mechanism.
+        let mock =
+            Arc::new(MockOllama::with_generate_response(HashMap::new(), r#"{"duration_minutes": 5}"#));
+        let router = Router::new(mock.clone(), "nomic-embed-text", "llama3.2:3b");
+        let def = timer_definition();
+
+        let (extracted, detail) = router.extract_params(&def, "five minutes please").await;
+
+        assert_eq!(extracted, Some(serde_json::json!({"duration_minutes": 5})));
+        assert_eq!(detail, None);
     }
 }
