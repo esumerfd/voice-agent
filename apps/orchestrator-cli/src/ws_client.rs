@@ -30,7 +30,8 @@ use shared::{
     CreateWorkflowRequest, CreateWorkflowResponse, DeleteWorkflowRequest, DeleteWorkflowResponse,
     DescribeWorkflowRequest, DescribeWorkflowResponse, Envelope, InvokeStatus,
     InvokeWorkflowRequest, InvokeWorkflowResponse, ListWorkflowsRequest, ListWorkflowsResponse,
-    OrchestratorClient, RequestPayload, ResponsePayload, WorkflowCreator, WorkflowDeleter,
+    OrchestratorClient, ProtocolFrame, RequestPayload, ResponsePayload, WorkflowCreator,
+    WorkflowDeleter,
 };
 
 /// The write half of the one WS connection this client owns.
@@ -41,6 +42,10 @@ type WsWrite = SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>;
 pub struct WsOrchestratorClient {
     write: Arc<AsyncMutex<WsWrite>>,
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<ResponsePayload>>>>,
+    /// Pending `ProtocolFrame` calls (plan 09-03, `call_protocol`) --
+    /// SEPARATE from `pending` above even though both share `next_id`, so a
+    /// `Res` and a `Protocol` reply can never contend for the same slot.
+    pending_protocol: Arc<Mutex<HashMap<u64, oneshot::Sender<ProtocolFrame>>>>,
     next_id: AtomicU64,
     /// Reserved `Event` frames (D-03) forwarded here by the read loop rather
     /// than treated as a pending `Res`. Nothing in Phase 4's CLI consumes
@@ -62,9 +67,12 @@ impl WsOrchestratorClient {
         let write = Arc::new(AsyncMutex::new(write));
         let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<ResponsePayload>>>> =
             Arc::new(Mutex::new(HashMap::new()));
+        let pending_protocol: Arc<Mutex<HashMap<u64, oneshot::Sender<ProtocolFrame>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
         let (events_tx, events_rx) = mpsc::unbounded_channel();
 
         let loop_pending = Arc::clone(&pending);
+        let loop_pending_protocol = Arc::clone(&pending_protocol);
         tokio::spawn(async move {
             while let Some(msg) = read.next().await {
                 let Ok(msg) = msg else {
@@ -103,12 +111,34 @@ impl WsOrchestratorClient {
                     // client (05-04) is the one that actually consumes these.
                     Envelope::Hello { .. } => {}
                     Envelope::Activity { .. } => {}
-                    // Phase 8 (D-01/D-05): orchestrator-cli doesn't consume
-                    // the Phase 8 protocol frames yet -- it never sends a
-                    // DescribeRun, so a Welcome or RunDescription arriving
-                    // is ignored rather than treated as unexpected,
-                    // mirroring the Req no-op arm above.
-                    Envelope::Protocol { .. } => {}
+                    // Plan 09-03 (T-09-12, the frame-id correlation hazard):
+                    // resolve a pending `call_protocol` entry ONLY for
+                    // reply-shaped variants (`RouteResult`/`RunDescription`).
+                    // `Welcome` is server-push-only and arrives with id 0 as
+                    // the very FIRST server-to-client frame on every
+                    // connection, before any request is ever made -- if it
+                    // resolved a pending entry by id alone, it would
+                    // silently steal a route issued as the connection's very
+                    // first request. `DescribeRun`/`RouteUtterance` are
+                    // client-to-daemon only and never arrive here at all.
+                    Envelope::Protocol { id, frame } => match frame {
+                        ProtocolFrame::RouteResult { .. } | ProtocolFrame::RunDescription { .. } => {
+                            let sender = {
+                                let mut guard = loop_pending_protocol
+                                    .lock()
+                                    .expect("ws_client pending_protocol mutex poisoned");
+                                guard.remove(&id)
+                            };
+                            if let Some(sender) = sender {
+                                let _ = sender.send(frame); // caller may have given up already -- a handled no-op
+                            }
+                        }
+                        ProtocolFrame::Welcome { .. } | ProtocolFrame::DescribeRun { .. } | ProtocolFrame::RouteUtterance { .. } => {
+                            // Server-push-only (Welcome) or client-to-daemon-only
+                            // (DescribeRun/RouteUtterance) -- never resolves a
+                            // pending call. Ignored defensively (T-04-07).
+                        }
+                    },
                 }
             }
         });
@@ -116,6 +146,7 @@ impl WsOrchestratorClient {
         Ok(Self {
             write,
             pending,
+            pending_protocol,
             next_id: AtomicU64::new(0),
             events: Arc::new(AsyncMutex::new(events_rx)),
         })
@@ -157,6 +188,48 @@ impl WsOrchestratorClient {
 
         rx.await
             .unwrap_or_else(|_| failure_payload("connection closed before a response arrived"))
+    }
+
+    /// Sends `frame` as a fresh `Envelope::Protocol`, suspends on a
+    /// `oneshot`, and returns the correlated reply `ProtocolFrame` once the
+    /// read loop resolves it (plan 09-03). Mirrors `call`'s structure
+    /// exactly: allocates an id from the SAME `next_id` counter `call` uses
+    /// -- sharing it keeps ids globally unique on the connection, so a `Res`
+    /// and a `Protocol` reply can never contend for the same slot. On any
+    /// encode or send failure, removes the pending entry and returns `Err`
+    /// naming the failure -- never a panic, matching `call`'s
+    /// `failure_payload` discipline.
+    pub async fn call_protocol(&self, frame: ProtocolFrame) -> Result<ProtocolFrame, String> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = oneshot::channel();
+        self.pending_protocol
+            .lock()
+            .expect("ws_client pending_protocol mutex poisoned")
+            .insert(id, tx);
+
+        let envelope = Envelope::Protocol { id, frame };
+        let Ok(text) = serde_json::to_string(&envelope) else {
+            self.pending_protocol
+                .lock()
+                .expect("ws_client pending_protocol mutex poisoned")
+                .remove(&id);
+            return Err("failed to encode protocol request envelope".to_string());
+        };
+
+        let send_result = {
+            let mut guard = self.write.lock().await;
+            guard.send(Message::text(text)).await
+        };
+        if send_result.is_err() {
+            self.pending_protocol
+                .lock()
+                .expect("ws_client pending_protocol mutex poisoned")
+                .remove(&id);
+            return Err("failed to send protocol request over the WS connection".to_string());
+        }
+
+        rx.await
+            .map_err(|_| "connection closed before a response arrived".to_string())
     }
 }
 

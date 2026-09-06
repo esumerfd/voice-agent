@@ -14,6 +14,7 @@ mod create;
 mod delete;
 mod list;
 mod log;
+mod route;
 mod run;
 mod ws_client;
 
@@ -135,6 +136,10 @@ async fn main() -> std::io::Result<()> {
                 &mut std::io::stdout(),
             )
             .await?;
+            std::process::exit(code);
+        }
+        Commands::Route { utterance } => {
+            let code = route::run(&client, &utterance, &mut std::io::stdout()).await?;
             std::process::exit(code);
         }
         Commands::Log { .. } => unreachable!("Commands::Log is fully handled above, before connect"),

@@ -43,6 +43,15 @@ pub enum Commands {
         #[command(subcommand)]
         command: WorkflowCommands,
     },
+    /// Try an utterance against the embedding intent router (plan 09-03,
+    /// D-02/D-03) -- a DRY-RUN trial surface only. Reports the matched
+    /// workflow id, its similarity score, and its confirmation tier; it
+    /// never invokes anything, mints a run id, or spends anything --
+    /// real dispatch stays exclusively on the `run` command.
+    Route {
+        /// The natural-language utterance to try against the router.
+        utterance: String,
+    },
     /// Tail the orchestratord daemon's log file (quick task 260812-qeg).
     ///
     /// Daemon-independent: works even with orchestratord not running --
