@@ -52,6 +52,23 @@
 //! (never a re-implemented lookup) so a client that reconnects after
 //! dropping mid-run can recover that run's current state and terminal
 //! result by `run_id` alone.
+//!
+//! Phase 8 (plan 08-03, D-03/D-04, FANOUT-01): `Hello.capabilities`
+//! (bounded via `bound_capabilities`, T-08-12) declares what gated result
+//! fields THIS connection can render, stored alongside `client_name`/
+//! `session_id` on `ConnEntry` (`connection_registry.rs`). A declared
+//! capability only ever WIDENS what a connection is allowed to see about
+//! its OWN runs -- it never selects a recipient, never grants addressing,
+//! and never grants ownership of a run someone else started. The
+//! async-mode terminal `Envelope::Event` is now delivered with
+//! `ConnectionRegistry::send_to`, addressed to the owning `ConnId` captured
+//! at request time (D-03), replacing the previous send-to-everyone
+//! broadcast; a send to an owner who has since disconnected is a handled
+//! no-op whose result stays recoverable via `DescribeRun`. The live
+//! `Activity` fan-out (`broadcast_activity`) is rebuilt per recipient
+//! through `shared::filter_activity_event_for` against each connection's
+//! own declared capabilities (D-04), so a bystander still sees that a run
+//! happened and how it ended, with only the gated field contents removed.
 
 mod session_id;
 
@@ -74,8 +91,9 @@ use crate::client::InProcessOrchestrator;
 use crate::definition::ServiceMode;
 use crate::error::ServerError;
 use shared::{
-    ActivityPhase, Envelope, InvokeStatus, InvokeWorkflowResponse, OrchestratorClient,
-    ProtocolFrame, RequestPayload, ResponsePayload, WorkflowCreator, WorkflowDeleter,
+    filter_activity_event_for, filter_output_for, ActivityPhase, Envelope, InvokeStatus,
+    InvokeWorkflowResponse, OrchestratorClient, ProtocolFrame, RequestPayload, ResponsePayload,
+    WorkflowCreator, WorkflowDeleter,
 };
 
 /// The write half of one accepted WS connection, shared (via `Arc<Mutex<..>>`)
@@ -92,6 +110,16 @@ type WsRead = SplitStream<WebSocketStream<TcpStream>>;
 /// caller falls back to the same `"unknown"` label used for a
 /// missing/malformed Hello.
 const MAX_CLIENT_NAME_LEN: usize = 256;
+
+/// A self-reported capability declaration (Phase 8 plan 08-03, D-03/D-04)
+/// listing more than this many entries degrades the WHOLE declaration to an
+/// empty list (T-08-12, ASVS V5) -- reject rather than truncate, mirroring
+/// `MAX_CLIENT_NAME_LEN`'s discipline for `client_name`.
+const MAX_CAPABILITIES: usize = 16;
+
+/// A single self-reported capability name longer than this also degrades
+/// the WHOLE declaration to an empty list (T-08-12).
+const MAX_CAPABILITY_LEN: usize = 64;
 
 /// The client-identity label used whenever the first frame on a connection
 /// is missing, unparseable, not `Hello`, or an oversized `Hello` (Pitfall 3,
@@ -148,7 +176,7 @@ async fn handle_connection(
     // before the general dispatch loop. If it decoded to something other
     // than Hello, don't discard it -- process it as a normal request below,
     // just under the "unknown" client label.
-    let (client_name, pending) = read_hello(&mut read).await;
+    let (client_name, capabilities, pending) = read_hello(&mut read).await;
 
     // Phase 8 (D-01/D-02): mint this connection's real identity immediately
     // after the Hello read, and send it back on a `Welcome` frame BEFORE
@@ -177,7 +205,7 @@ async fn handle_connection(
 
     let (tx, mut rx) = mpsc::unbounded_channel::<Envelope>();
     registry
-        .register(conn_id, client_name.clone(), session_id.clone(), tx)
+        .register(conn_id, client_name.clone(), session_id.clone(), capabilities.clone(), tx)
         .await;
 
     // Per-connection drain task (RESEARCH Pattern 1): forwards anything
@@ -201,6 +229,7 @@ async fn handle_connection(
             &client_name,
             conn_id,
             &session_id,
+            &capabilities,
         )
         .await;
     }
@@ -249,6 +278,7 @@ async fn handle_connection(
             &client_name,
             conn_id,
             &session_id,
+            &capabilities,
         )
         .await;
     }
@@ -263,33 +293,34 @@ async fn handle_connection(
 
 /// Reads exactly one frame before the general dispatch loop and requires it
 /// be `Envelope::Hello` (Pitfall 3). The returned `client_name` defaults to
-/// `"unknown"` whenever the first frame is missing, unparseable, an
-/// oversized Hello, or anything other than Hello -- a deliberate lenient
+/// `"unknown"`, and the returned capability list defaults to empty (Phase 8
+/// plan 08-03, D-03/D-04), whenever the first frame is missing, unparseable,
+/// an oversized Hello, or anything other than Hello -- a deliberate lenient
 /// degrade (RESEARCH Open Question 1), never fatal to the connection. If
 /// the first frame decoded successfully as something other than `Hello`, it
 /// is returned so the caller can still process it as a normal request
 /// instead of silently discarding it (this is what keeps every pre-Phase-5
 /// test -- which never sends a Hello at all -- working unchanged).
-async fn read_hello(read: &mut WsRead) -> (String, Option<Envelope>) {
+async fn read_hello(read: &mut WsRead) -> (String, Vec<String>, Option<Envelope>) {
     let Some(Ok(msg)) = read.next().await else {
-        return (UNKNOWN_CLIENT.to_string(), None);
+        return (UNKNOWN_CLIENT.to_string(), Vec::new(), None);
     };
 
     if msg.is_close() {
-        return (UNKNOWN_CLIENT.to_string(), None);
+        return (UNKNOWN_CLIENT.to_string(), Vec::new(), None);
     }
 
     let Ok(text) = msg.to_text() else {
-        return (UNKNOWN_CLIENT.to_string(), None);
+        return (UNKNOWN_CLIENT.to_string(), Vec::new(), None);
     };
 
     match serde_json::from_str::<Envelope>(text) {
-        Ok(Envelope::Hello { client_name }) => match bound_client_name(client_name) {
-            Some(name) => (name, None),
-            None => (UNKNOWN_CLIENT.to_string(), None),
+        Ok(Envelope::Hello { client_name, capabilities }) => match bound_client_name(client_name) {
+            Some(name) => (name, bound_capabilities(capabilities), None),
+            None => (UNKNOWN_CLIENT.to_string(), Vec::new(), None),
         },
-        Ok(other) => (UNKNOWN_CLIENT.to_string(), Some(other)),
-        Err(_) => (UNKNOWN_CLIENT.to_string(), None),
+        Ok(other) => (UNKNOWN_CLIENT.to_string(), Vec::new(), Some(other)),
+        Err(_) => (UNKNOWN_CLIENT.to_string(), Vec::new(), None),
     }
 }
 
@@ -305,6 +336,22 @@ fn bound_client_name(client_name: String) -> Option<String> {
     }
 }
 
+/// Bounds a self-reported capability declaration (Phase 8 plan 08-03,
+/// T-08-12, ASVS V5). An over-count list, or a list containing one
+/// over-length entry, resolves the WHOLE declaration to an empty list --
+/// reject rather than truncate, mirroring `bound_client_name`'s discipline
+/// -- so an oversized declaration degrades to a still-functional,
+/// capability-less connection, never a fatal error.
+fn bound_capabilities(capabilities: Vec<String>) -> Vec<String> {
+    let over_count = capabilities.len() > MAX_CAPABILITIES;
+    let over_length = capabilities.iter().any(|c| c.chars().count() > MAX_CAPABILITY_LEN);
+    if over_count || over_length {
+        Vec::new()
+    } else {
+        capabilities
+    }
+}
+
 /// Routes one decoded envelope after the Hello-first step -- shared by both
 /// the pending-first-frame path (in `handle_connection`) and the general
 /// read loop, so the two code paths can never drift apart.
@@ -317,6 +364,7 @@ async fn dispatch_envelope(
     client_name: &str,
     conn_id: ConnId,
     session_id: &str,
+    capabilities: &[String],
 ) {
     match envelope {
         Envelope::Req { id, payload } => {
@@ -330,6 +378,7 @@ async fn dispatch_envelope(
                 client_name,
                 conn_id,
                 session_id,
+                capabilities,
             )
             .await;
         }
@@ -387,10 +436,12 @@ async fn dispatch_envelope(
 /// 3 -- never `Registry::load`/`validate_payload` directly here).
 ///
 /// `conn_id`/`session_id` (Phase 8, D-01/D-02) are threaded through
-/// additively, in the same style `client_name` was threaded (05-04) --
-/// this plan does not yet consume `conn_id` here (plan 08-03 addresses
-/// results by `conn_id`), but it must already be in scope by the time that
-/// plan lands.
+/// additively, in the same style `client_name` was threaded (05-04).
+/// `capabilities` (Phase 8 plan 08-03, D-03/D-04) is this connection's own
+/// bounded declaration: `conn_id` is what identifies the run's OWNER for
+/// addressed delivery, never anything derived from `capabilities` itself --
+/// declaring a capability only ever widens what this connection sees about
+/// its OWN runs.
 async fn handle_request(
     id: u64,
     payload: RequestPayload,
@@ -401,6 +452,7 @@ async fn handle_request(
     client_name: &str,
     conn_id: ConnId,
     session_id: &str,
+    capabilities: &[String],
 ) {
     match payload {
         // Quick task 260807-shx Task 3: a thin decode-call-encode wrapper
@@ -469,6 +521,16 @@ async fn handle_request(
                     // just async ones -- a sync run shows up as a tracked
                     // activity in the TUI.
                     resp.run_id = Some(run_id);
+
+                    // D-03: the sync reply's output is filtered through the
+                    // SAME capability-addressing rule the async terminal
+                    // Event uses. The invoking connection is always this
+                    // run's owner, so its own declared capabilities are the
+                    // right filter -- addressing is a non-issue here since
+                    // there is only ever one recipient, the caller itself.
+                    if let Some(output) = &resp.output {
+                        resp.output = Some(filter_output_for(output, capabilities));
+                    }
                     send_res(write, id, ResponsePayload::InvokeWorkflow(resp)).await;
                 }
                 ServiceMode::Async => {
@@ -493,6 +555,13 @@ async fn handle_request(
                     let registry = registry.clone();
                     let activity_registry = Arc::clone(activity_registry);
                     let workflow_id = workflow_id.clone();
+                    // D-03: captured now, before the spawn, so the terminal
+                    // Event is addressed to the connection that actually
+                    // issued this request -- never re-derived later, and
+                    // never influenced by anything a connection declares on
+                    // Hello.
+                    let owner_conn_id = conn_id;
+                    let owner_capabilities = capabilities.to_vec();
                     tokio::spawn(async move {
                         // D-06: Running fires when the spawned task
                         // actually begins, distinct from the Invoked
@@ -500,7 +569,7 @@ async fn handle_request(
                         activity_registry.record_transition(&run_id, ActivityPhase::Running, None);
                         broadcast_activity(&registry, &activity_registry, &run_id).await;
 
-                        let resp = orchestrator.invoke_workflow(req).await;
+                        let mut resp = orchestrator.invoke_workflow(req).await;
 
                         let (phase, detail) = phase_and_detail_for(&resp);
                         activity_registry.record_transition(&run_id, phase, detail);
@@ -511,15 +580,23 @@ async fn handle_request(
                         // above -- no second clock read.
                         emit_run_log(&orchestrator, &activity_registry, &workflow_id, &run_id, phase);
 
-                        // D-01: broadcast the terminal result to every
-                        // connected client, not just the connection that
-                        // started this run -- "every client sees every
-                        // activity". ConnectionRegistry::broadcast already
-                        // treats a send to a disconnected client as a
-                        // handled no-op (Pitfall 1), preserving the
-                        // pre-existing "a run survives a disconnected
-                        // client" guarantee (D-08/T-04-04).
-                        broadcast_event(&registry, id, ResponsePayload::InvokeWorkflow(resp)).await;
+                        // D-03: deliver the terminal result addressed to
+                        // ONLY the owning connection -- never a broadcast to
+                        // every connected client. `send_to` treats a send to
+                        // an owner who has since disconnected as a handled
+                        // no-op (mirroring the old broadcast's Pitfall-1
+                        // discipline); the result stays recoverable via
+                        // DescribeRun regardless. The output is filtered
+                        // through the OWNER's own declared capabilities,
+                        // never anything else's.
+                        if let Some(output) = &resp.output {
+                            resp.output = Some(filter_output_for(output, &owner_capabilities));
+                        }
+                        let event = Envelope::Event {
+                            id,
+                            payload: ResponsePayload::InvokeWorkflow(resp),
+                        };
+                        registry.send_to(owner_conn_id, &event).await;
                     });
                 }
             }
@@ -544,13 +621,23 @@ fn phase_and_detail_for(resp: &InvokeWorkflowResponse) -> (ActivityPhase, Option
     }
 }
 
-/// Broadcasts the current `ActivityEvent` snapshot for `run_id` to every
-/// connected client (D-01), if the registry still knows about it. A no-op
-/// for an unknown `run_id` -- mirrors `ActivityRegistry::record_transition`'s
-/// own never-panic-on-unknown-run_id discipline.
+/// Fans the current `ActivityEvent` snapshot for `run_id` out to every
+/// connected client (D-01), if the registry still knows about it -- a no-op
+/// for an unknown `run_id`, mirroring
+/// `ActivityRegistry::record_transition`'s own never-panic-on-unknown-run_id
+/// discipline. Phase 8 (plan 08-03, D-04): rather than one shared
+/// broadcast, this builds one FILTERED frame per recipient through
+/// `filter_activity_event_for` against that connection's own declared
+/// capabilities -- a bystander still sees that the run happened and how it
+/// ended, with only gated field contents stripped. `recipients()` snapshots
+/// the registry and releases its lock before any send, so a slow receiver
+/// here still cannot block delivery to another (Pitfall 1 preserved).
 async fn broadcast_activity(registry: &ConnectionRegistry, activity_registry: &ActivityRegistry, run_id: &str) {
     if let Some(event) = activity_registry.get(run_id) {
-        registry.broadcast(&Envelope::Activity { event }).await;
+        for (conn_id, declared) in registry.recipients().await {
+            let filtered = filter_activity_event_for(&event, &declared);
+            registry.send_to(conn_id, &Envelope::Activity { event: filtered }).await;
+        }
     }
 }
 
@@ -615,17 +702,6 @@ async fn send_protocol(write: &Arc<Mutex<WsWrite>>, id: u64, frame: ProtocolFram
     send_frame(write, &Envelope::Protocol { id, frame }).await;
 }
 
-/// Encodes and broadcasts an `Envelope::Event` to every connected client
-/// (D-01) -- the async-mode terminal-result push. Broadcasting (rather than
-/// writing only to the originating connection's write half) is what makes
-/// "every client sees every activity" true; `ConnectionRegistry::broadcast`
-/// already treats a send to a disconnected client as a handled no-op
-/// (Pitfall 1), preserving the existing "a run survives a disconnected
-/// client" guarantee (D-08/T-04-04).
-async fn broadcast_event(registry: &ConnectionRegistry, id: u64, payload: ResponsePayload) {
-    registry.broadcast(&Envelope::Event { id, payload }).await;
-}
-
 /// Builds a best-effort `InvokeWorkflowResponse`-shaped error `Res` for a
 /// decode/routing failure that has no real request `id` to correlate with
 /// (frame never decoded, or decoded to something other than a `Req`).
@@ -688,8 +764,8 @@ fn emit_run_log(
 /// failure and a `Sink::send` failure as handled no-ops (never `.unwrap()`/
 /// `.expect()`) -- required for T-04-01 (malformed frame isolation) and
 /// T-04-04 (disconnected-client event push, D-08). Used directly by the
-/// per-connection drain task (RESEARCH Pattern 1) in addition to
-/// `send_res`/`broadcast_event` above.
+/// per-connection drain task (RESEARCH Pattern 1) in addition to `send_res`
+/// above and `ConnectionRegistry::send_to`/`broadcast`.
 async fn send_frame(write: &Arc<Mutex<WsWrite>>, envelope: &Envelope) {
     let Ok(text) = serde_json::to_string(envelope) else {
         return; // an internal encode failure must not panic this task

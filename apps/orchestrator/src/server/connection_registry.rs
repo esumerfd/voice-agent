@@ -32,6 +32,12 @@ type EventTx = mpsc::UnboundedSender<Envelope>;
 struct ConnEntry {
     client_name: String,
     session_id: String,
+    /// Self-reported gated-field capabilities (Phase 8 plan 08-03,
+    /// D-03/D-04) declared on this connection's `Hello` -- consulted by
+    /// `recipients()` so the per-recipient `Activity` fan-out and the
+    /// addressed terminal `Event` can filter to exactly what THIS
+    /// connection declared it can render.
+    capabilities: Vec<String>,
     tx: EventTx,
 }
 
@@ -56,14 +62,23 @@ pub fn next_conn_id() -> ConnId {
 
 impl ConnectionRegistry {
     /// Registers `id` with its self-reported `client_name` (from Hello,
-    /// D-03/D-04), its server-minted `session_id` (D-01/D-02), and the
-    /// sender half of its per-connection mpsc channel.
-    pub async fn register(&self, id: ConnId, client_name: String, session_id: String, tx: EventTx) {
+    /// D-03/D-04), its server-minted `session_id` (D-01/D-02), its
+    /// self-reported, already-bounded `capabilities` (Phase 8 plan 08-03,
+    /// D-03/D-04), and the sender half of its per-connection mpsc channel.
+    pub async fn register(
+        &self,
+        id: ConnId,
+        client_name: String,
+        session_id: String,
+        capabilities: Vec<String>,
+        tx: EventTx,
+    ) {
         self.inner.lock().await.insert(
             id,
             ConnEntry {
                 client_name,
                 session_id,
+                capabilities,
                 tx,
             },
         );
@@ -106,11 +121,38 @@ impl ConnectionRegistry {
     /// (Pitfall 1): `unbounded_send` only errors when that one receiver has
     /// already been dropped, which is a handled no-op — exactly like this
     /// module's existing `send_frame` contract in `server/mod.rs`.
+    #[allow(dead_code)] // Phase 8 plan 08-03 (D-03/D-04) replaced every production call site with per-recipient send_to; kept as a general-purpose primitive and exercised directly by this file's own tests
     pub async fn broadcast(&self, env: &Envelope) {
         let guard = self.inner.lock().await;
         for entry in guard.values() {
             let _ = entry.tx.send(env.clone());
         }
+    }
+
+    /// Delivers `env` to exactly the connection identified by `id` (D-03) --
+    /// never to any other registered connection. Both an absent entry
+    /// (never registered, or already deregistered) and a dropped receiver
+    /// are a handled no-op, mirroring `broadcast`'s own
+    /// never-panic-on-external-state discipline; unlike `broadcast`, this
+    /// looks up one entry rather than iterating every one.
+    pub async fn send_to(&self, id: ConnId, env: &Envelope) {
+        let guard = self.inner.lock().await;
+        if let Some(entry) = guard.get(&id) {
+            let _ = entry.tx.send(env.clone());
+        }
+    }
+
+    /// Returns every registered connection's id paired with its declared
+    /// capabilities (D-04), so a caller (the per-recipient `Activity`
+    /// fan-out in `server/mod.rs`) can build one filtered frame per
+    /// recipient without holding the registry lock across any send.
+    pub async fn recipients(&self) -> Vec<(ConnId, Vec<String>)> {
+        self.inner
+            .lock()
+            .await
+            .iter()
+            .map(|(id, entry)| (*id, entry.capabilities.clone()))
+            .collect()
     }
 }
 
@@ -121,6 +163,7 @@ mod tests {
     fn hello(name: &str) -> Envelope {
         Envelope::Hello {
             client_name: name.to_string(),
+            capabilities: Vec::new(),
         }
     }
 
@@ -128,12 +171,14 @@ mod tests {
     async fn register_then_broadcast_delivers_to_that_connection() {
         let registry = ConnectionRegistry::default();
         let (tx, mut rx) = mpsc::unbounded_channel();
-        registry.register(1, "test-client".to_string(), "sess-0".to_string(), tx).await;
+        registry
+            .register(1, "test-client".to_string(), "sess-0".to_string(), Vec::new(), tx)
+            .await;
 
         registry.broadcast(&hello("orchestrator-cli")).await;
 
         match rx.recv().await {
-            Some(Envelope::Hello { client_name }) => {
+            Some(Envelope::Hello { client_name, .. }) => {
                 assert_eq!(client_name, "orchestrator-cli");
             }
             other => panic!("expected a delivered Hello envelope, got: {other:?}"),
@@ -145,8 +190,8 @@ mod tests {
         let registry = ConnectionRegistry::default();
         let (tx1, mut rx1) = mpsc::unbounded_channel();
         let (tx2, mut rx2) = mpsc::unbounded_channel();
-        registry.register(1, "a".to_string(), "sess-0".to_string(), tx1).await;
-        registry.register(2, "b".to_string(), "sess-1".to_string(), tx2).await;
+        registry.register(1, "a".to_string(), "sess-0".to_string(), Vec::new(), tx1).await;
+        registry.register(2, "b".to_string(), "sess-1".to_string(), Vec::new(), tx2).await;
 
         registry.broadcast(&hello("orchestrator-tui")).await;
 
@@ -159,8 +204,8 @@ mod tests {
         let registry = ConnectionRegistry::default();
         let (tx1, rx1) = mpsc::unbounded_channel();
         let (tx2, mut rx2) = mpsc::unbounded_channel();
-        registry.register(1, "dead".to_string(), "sess-0".to_string(), tx1).await;
-        registry.register(2, "alive".to_string(), "sess-1".to_string(), tx2).await;
+        registry.register(1, "dead".to_string(), "sess-0".to_string(), Vec::new(), tx1).await;
+        registry.register(2, "alive".to_string(), "sess-1".to_string(), Vec::new(), tx2).await;
         drop(rx1); // simulate a disconnected client whose receiver is gone
 
         // Must not panic, and must still reach the surviving connection.
@@ -176,7 +221,7 @@ mod tests {
     async fn deregister_removes_the_entry_so_broadcast_no_longer_targets_it() {
         let registry = ConnectionRegistry::default();
         let (tx, mut rx) = mpsc::unbounded_channel();
-        registry.register(1, "test-client".to_string(), "sess-0".to_string(), tx).await;
+        registry.register(1, "test-client".to_string(), "sess-0".to_string(), Vec::new(), tx).await;
         registry.deregister(1).await;
 
         registry.broadcast(&hello("orchestrator-cli")).await;
@@ -204,10 +249,10 @@ mod tests {
         let (tx1, _rx1) = mpsc::unbounded_channel();
         let (tx2, _rx2) = mpsc::unbounded_channel();
         registry
-            .register(1, "orchestrator-cli".to_string(), "sess-0".to_string(), tx1)
+            .register(1, "orchestrator-cli".to_string(), "sess-0".to_string(), Vec::new(), tx1)
             .await;
         registry
-            .register(2, "orchestrator-cli".to_string(), "sess-1".to_string(), tx2)
+            .register(2, "orchestrator-cli".to_string(), "sess-1".to_string(), Vec::new(), tx2)
             .await;
 
         let session_1 = registry.session_id(1).await.expect("expected connection 1 to be registered");
@@ -216,5 +261,67 @@ mod tests {
             session_1, session_2,
             "expected distinct session ids for two connections sharing the same client_name"
         );
+    }
+
+    /// D-03: `send_to` reaches only the connection identified by `id`; a
+    /// second registered connection that was not addressed receives
+    /// nothing.
+    #[tokio::test]
+    async fn send_to_reaches_only_the_addressed_connection() {
+        let registry = ConnectionRegistry::default();
+        let (tx1, mut rx1) = mpsc::unbounded_channel();
+        let (tx2, mut rx2) = mpsc::unbounded_channel();
+        registry.register(1, "a".to_string(), "sess-0".to_string(), Vec::new(), tx1).await;
+        registry.register(2, "b".to_string(), "sess-1".to_string(), Vec::new(), tx2).await;
+
+        registry.send_to(1, &hello("orchestrator-cli")).await;
+
+        assert!(
+            rx1.recv().await.is_some(),
+            "expected the addressed connection to receive the frame"
+        );
+        assert!(
+            rx2.try_recv().is_err(),
+            "expected a connection that was not addressed to receive nothing"
+        );
+    }
+
+    /// D-03: `send_to` for a never-registered or already-deregistered id is
+    /// a handled no-op -- it neither panics nor reaches any other
+    /// connection.
+    #[tokio::test]
+    async fn send_to_a_never_registered_or_deregistered_id_is_a_handled_no_op() {
+        let registry = ConnectionRegistry::default();
+        // Never registered at all -- must not panic.
+        registry.send_to(99, &hello("orchestrator-cli")).await;
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        registry.register(1, "a".to_string(), "sess-0".to_string(), Vec::new(), tx).await;
+        registry.deregister(1).await;
+
+        registry.send_to(1, &hello("orchestrator-cli")).await;
+
+        assert!(
+            rx.try_recv().is_err(),
+            "expected a deregistered connection to receive nothing from send_to"
+        );
+    }
+
+    /// D-04: `recipients` returns every registered connection's id paired
+    /// with its declared capabilities.
+    #[tokio::test]
+    async fn recipients_returns_every_registered_connection_with_its_declared_capabilities() {
+        let registry = ConnectionRegistry::default();
+        let (tx1, _rx1) = mpsc::unbounded_channel();
+        let (tx2, _rx2) = mpsc::unbounded_channel();
+        registry
+            .register(1, "a".to_string(), "sess-0".to_string(), vec!["speech".to_string()], tx1)
+            .await;
+        registry.register(2, "b".to_string(), "sess-1".to_string(), Vec::new(), tx2).await;
+
+        let mut recipients = registry.recipients().await;
+        recipients.sort_by_key(|(id, _)| *id);
+
+        assert_eq!(recipients, vec![(1, vec!["speech".to_string()]), (2, Vec::new())]);
     }
 }

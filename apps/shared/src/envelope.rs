@@ -34,6 +34,18 @@
 //! connection mid-run recover that run's current state by `run_id` -- the
 //! identifier it already holds from the original `Started` ack -- never by
 //! connection/session identity.
+//!
+//! Phase 8 (plan 08-03, D-03/D-04, FANOUT-01) extends `Hello` again with a
+//! flat `capabilities` list: a client declares which gated result fields it
+//! can render (e.g. a speech-shaped one). A declared capability only ever
+//! WIDENS what THIS connection is allowed to render for its OWN runs -- it
+//! never grants addressing of, or ownership over, a run some other
+//! connection started. `capabilities` rides on `Hello` -- a top-level,
+//! internally-tagged `Envelope` variant -- rather than being folded into
+//! `ProtocolFrame` or the untagged `RequestPayload`/`ResponsePayload` enums
+//! (D-05); `#[serde(default)]` means a `Hello` from any pre-Phase-8 client,
+//! which carries no `capabilities` key at all, deserializes to an empty
+//! list and is served exactly as it is today.
 
 use serde::{Deserialize, Serialize};
 
@@ -68,9 +80,20 @@ pub enum Envelope {
     /// client sends per connection, before any `Req`. Carries no `id`
     /// because it never correlates to a reply. `client_name` is a plain
     /// self-reported string (e.g. `"orchestrator-cli"` /
-    /// `"orchestrator-tui"`) — no authentication or capability negotiation
-    /// (Deferred).
-    Hello { client_name: String },
+    /// `"orchestrator-tui"`) — no authentication.
+    Hello {
+        client_name: String,
+        /// Self-reported gated-field capabilities (Phase 8, D-03/D-04,
+        /// FANOUT-01) — e.g. `["speech"]`. Declaring a capability only ever
+        /// widens what THIS connection is allowed to render for its OWN
+        /// runs; it never grants addressing or ownership of a run another
+        /// connection started. `#[serde(default)]` so a `Hello` frame from
+        /// any pre-Phase-8 client (no `capabilities` key at all)
+        /// deserializes to an empty list and is served exactly as it is
+        /// today.
+        #[serde(default)]
+        capabilities: Vec<String>,
+    },
     /// Daemon-to-client activity snapshot (D-01/D-03) — pushed as a replay
     /// burst to a newly-connected client and again on every live lifecycle
     /// transition thereafter. Server-push-only: a client must never send
@@ -806,6 +829,7 @@ mod tests {
     fn hello_serializes_with_literal_type_hello() {
         let envelope = Envelope::Hello {
             client_name: "orchestrator-tui".to_string(),
+            capabilities: Vec::new(),
         };
 
         let value = serde_json::to_value(&envelope).expect("serialize");
@@ -821,8 +845,47 @@ mod tests {
     fn hello_round_trips() {
         let envelope = Envelope::Hello {
             client_name: "orchestrator-cli".to_string(),
+            capabilities: Vec::new(),
         };
         assert_round_trips(&envelope);
+    }
+
+    /// Phase 8 (D-03/D-04): a `Hello` declaring capabilities round-trips
+    /// them intact.
+    #[test]
+    fn hello_round_trips_with_capabilities() {
+        let envelope = Envelope::Hello {
+            client_name: "voice-front-end".to_string(),
+            capabilities: vec!["speech".to_string()],
+        };
+        assert_round_trips(&envelope);
+
+        let value = serde_json::to_value(&envelope).expect("serialize");
+        assert_eq!(
+            value["capabilities"],
+            json!(["speech"]),
+            "expected the declared capabilities to survive, got: {value}"
+        );
+    }
+
+    /// Backward compatibility (D-03/D-04): a raw `Hello` JSON literal with
+    /// no `capabilities` key at all -- every client that predates this
+    /// phase -- deserializes to an empty list, never a decode error.
+    #[test]
+    fn hello_with_no_capabilities_key_deserializes_to_an_empty_list() {
+        let raw = json!({"type": "hello", "client_name": "orchestrator-cli"});
+        let envelope: Envelope =
+            serde_json::from_value(raw).expect("capabilities-less hello should deserialize");
+
+        match envelope {
+            Envelope::Hello { capabilities, .. } => {
+                assert!(
+                    capabilities.is_empty(),
+                    "expected an absent capabilities key to default to an empty list, got: {capabilities:?}"
+                );
+            }
+            other => panic!("expected Envelope::Hello, got: {other:?}"),
+        }
     }
 
     #[test]
