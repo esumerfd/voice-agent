@@ -8,8 +8,14 @@
 //! Mirrors `agent_workflow_write_integration.rs`'s conventions: a `TempDir`
 //! fixture written via `fs::write`, `Registry::load` for the read side, and
 //! `registry::writer::create_workflow` for the write side.
+//!
+//! Task 2 (backward compatibility): every pre-Phase-8 workflow `.md` file
+//! must keep loading with zero warnings, and an absent/empty/null `intent`
+//! or `triggers` value must resolve to the same non-breaking default as
+//! every other absent value in this schema -- never a `LoadError`.
 
 use std::fs;
+use std::path::Path;
 
 use orchestrator::registry::writer;
 use orchestrator::Registry;
@@ -144,4 +150,151 @@ fn a_crafted_intent_with_yaml_control_characters_reloads_as_one_unchanged_scalar
         orchestrator::definition::DEFAULT_HANDLER,
         "expected service.handler unaffected by the hostile intent"
     );
+}
+
+/// Task 2 (backward compatibility): every workflow `.md` file committed
+/// before Phase 8 loads with zero `LoadError`s and resolves to an empty
+/// `intent` and an empty `triggers` -- a warning-free load is the criterion,
+/// not merely a count of loaded definitions. Located relative to
+/// `CARGO_MANIFEST_DIR` (mirrors `registry_integration.rs`'s existing
+/// `real_workflows_directory_loads_with_zero_errors_and_all_four_ids_present`
+/// precedent) rather than a hardcoded absolute path.
+#[test]
+fn real_workflows_directory_loads_with_zero_errors_and_empty_intent_and_triggers() {
+    let workflows_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../workflows");
+
+    let (registry, errors) = Registry::load(&workflows_dir);
+
+    assert!(
+        errors.is_empty(),
+        "expected the committed workflows/ dir to load with zero errors: {errors:?}"
+    );
+
+    let ids: Vec<String> = registry.enumerate().into_iter().map(|s| s.id).collect();
+    assert!(
+        !ids.is_empty(),
+        "expected at least one pre-Phase-8 workflow to be loaded"
+    );
+
+    for id in &ids {
+        let def = registry
+            .lookup(id)
+            .unwrap_or_else(|| panic!("expected {id} to resolve via lookup"));
+        assert_eq!(
+            def.intent, "",
+            "expected pre-Phase-8 workflow {id} to resolve to an empty intent, got: {:?}",
+            def.intent
+        );
+        assert!(
+            def.triggers.is_empty(),
+            "expected pre-Phase-8 workflow {id} to resolve to an empty triggers list, got: {:?}",
+            def.triggers
+        );
+    }
+}
+
+const TRIGGERS_ABSENT_MD: &str = r#"---
+id: triggers_absent
+name: Triggers Absent
+service:
+  handler: action.immediate
+---
+Body prose.
+"#;
+
+const TRIGGERS_EMPTY_LIST_MD: &str = r#"---
+id: triggers_empty_list
+name: Triggers Empty List
+service:
+  handler: action.immediate
+triggers: []
+---
+Body prose.
+"#;
+
+const TRIGGERS_NULL_MD: &str = r#"---
+id: triggers_null
+name: Triggers Null
+service:
+  handler: action.immediate
+triggers: null
+---
+Body prose.
+"#;
+
+/// An absent `triggers:` key, an empty `triggers: []`, and an explicit YAML
+/// `null` all resolve to the same empty list -- none is a `LoadError`.
+#[test]
+fn absent_empty_list_and_explicit_null_triggers_all_resolve_to_the_same_empty_list() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    fs::write(dir.path().join("triggers_absent.md"), TRIGGERS_ABSENT_MD).expect("write fixture");
+    fs::write(
+        dir.path().join("triggers_empty_list.md"),
+        TRIGGERS_EMPTY_LIST_MD,
+    )
+    .expect("write fixture");
+    fs::write(dir.path().join("triggers_null.md"), TRIGGERS_NULL_MD).expect("write fixture");
+
+    let (registry, errors) = Registry::load(dir.path());
+    assert!(errors.is_empty(), "unexpected load errors: {errors:?}");
+
+    for id in ["triggers_absent", "triggers_empty_list", "triggers_null"] {
+        let def = registry
+            .lookup(id)
+            .unwrap_or_else(|| panic!("expected {id} to resolve via lookup"));
+        assert!(
+            def.triggers.is_empty(),
+            "expected {id}'s triggers to resolve to an empty list, got: {:?}",
+            def.triggers
+        );
+    }
+}
+
+const INTENT_ABSENT_MD: &str = r#"---
+id: intent_absent
+name: Intent Absent
+service:
+  handler: action.immediate
+---
+Body prose.
+"#;
+
+const INTENT_EMPTY_STRING_MD: &str = r#"---
+id: intent_empty_string
+name: Intent Empty String
+service:
+  handler: action.immediate
+intent: ""
+---
+Body prose.
+"#;
+
+/// An absent `intent:` key and an explicit empty-string `intent: ""` both
+/// resolve to the empty string -- neither is a `LoadError`.
+#[test]
+fn absent_intent_and_empty_string_intent_both_resolve_to_empty_string_with_no_load_error() {
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    fs::write(dir.path().join("intent_absent.md"), INTENT_ABSENT_MD).expect("write fixture");
+    fs::write(
+        dir.path().join("intent_empty_string.md"),
+        INTENT_EMPTY_STRING_MD,
+    )
+    .expect("write fixture");
+
+    let (registry, errors) = Registry::load(dir.path());
+    assert!(
+        errors.is_empty(),
+        "an absent or empty-string intent must never produce a LoadError: {errors:?}"
+    );
+
+    for id in ["intent_absent", "intent_empty_string"] {
+        let def = registry
+            .lookup(id)
+            .unwrap_or_else(|| panic!("expected {id} to resolve via lookup"));
+        assert_eq!(
+            def.intent, "",
+            "expected {id}'s intent to resolve to the empty string, got: {:?}",
+            def.intent
+        );
+    }
 }
