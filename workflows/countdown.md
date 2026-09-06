@@ -1,7 +1,7 @@
 ---
 id: countdown
 name: Countdown
-intent: count down out loud from three to go as a spoken start signal
+intent: count down out loud from three to go as a spoken cue to start something right now
 parameters:
 service:
   type: action
