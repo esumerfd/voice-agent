@@ -20,13 +20,18 @@ use serde::Deserialize;
 
 use crate::error::RouterError;
 use crate::router::threshold::OLLAMA_TIMEOUT_SECS;
+use crate::router::OLLAMA_KEEP_ALIVE;
 
 /// `POST {base_url}/api/embed` request body (RESEARCH Pattern 2, verified
 /// live shape: `input` accepts a batch array even for a single string).
+/// Carries `keep_alive` (plan 09-04 Task 3, COVERAGE.md row 3) so the
+/// measured cold-load penalty does not silently return after Ollama's
+/// default ~5-minute idle unload.
 #[derive(serde::Serialize)]
 struct EmbedRequest<'a> {
     model: &'a str,
     input: &'a [String],
+    keep_alive: &'a str,
 }
 
 /// `embeddings` is always an array-of-arrays, even for a single input
@@ -54,6 +59,8 @@ pub struct OllamaErrorBody {
 /// `"json"`. `system` and `prompt` are two structurally separate fields
 /// (T-09-01) -- `system` is the fixed extraction instruction, `prompt` is
 /// the untrusted utterance alone.
+/// Also carries `keep_alive` (plan 09-04 Task 3, COVERAGE.md row 3) for the
+/// same reason `EmbedRequest` does -- see that struct's doc comment.
 #[derive(serde::Serialize)]
 struct GenerateRequest<'a> {
     model: &'a str,
@@ -62,6 +69,7 @@ struct GenerateRequest<'a> {
     stream: bool,
     format: &'a serde_json::Value,
     options: GenerateOptions,
+    keep_alive: &'a str,
 }
 
 /// Temperature 0 with a fixed seed makes extraction reproducible -- the same
@@ -180,7 +188,7 @@ fn classify_send_error(e: &reqwest::Error, base_url: &str, endpoint: &str) -> Ro
 impl OllamaApi for HttpOllamaClient {
     async fn embed(&self, model: &str, inputs: &[String]) -> Result<Vec<Vec<f32>>, RouterError> {
         let endpoint = format!("{}/api/embed", self.base_url);
-        let body = EmbedRequest { model, input: inputs };
+        let body = EmbedRequest { model, input: inputs, keep_alive: OLLAMA_KEEP_ALIVE };
 
         let response = self
             .http
@@ -236,6 +244,7 @@ impl OllamaApi for HttpOllamaClient {
             stream: false,
             format: schema,
             options: GenerateOptions { temperature: EXTRACTION_TEMPERATURE, seed: EXTRACTION_SEED },
+            keep_alive: OLLAMA_KEEP_ALIVE,
         };
 
         let response = self

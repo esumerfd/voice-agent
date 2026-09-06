@@ -35,6 +35,23 @@ use crate::definition::WorkflowDefinition;
 use crate::error::RouterError;
 use crate::registry::Registry;
 
+/// Every Ollama request (embed AND generate) carries this `keep_alive`
+/// value (plan 09-04 Task 3, COVERAGE.md row 3): Ollama unloads an idle
+/// model after roughly five minutes by default, so a startup warm-up alone
+/// only removes the cold-load cost for the FIRST request after a daemon
+/// start -- the measured multi-second penalty silently returns after every
+/// quiet period, and a voice assistant is exactly that bursty (long gaps
+/// between utterances, not a steady request stream). `"30m"` sits in the
+/// tens-of-minutes range RESEARCH recommends: long enough to survive a
+/// normal between-utterances gap without re-paying the cold-load tax, short
+/// enough that an abandoned session eventually frees the RAM both
+/// `nomic-embed-text` and the extraction model hold resident on this
+/// CPU-only, single-user machine -- a real trade-off on a machine with no
+/// other workload to reclaim that memory from. Declared here (not in
+/// `router::threshold`, which plan 09-05 owns) to preserve the two plans'
+/// file disjointness within this wave.
+pub const OLLAMA_KEEP_ALIVE: &str = "30m";
+
 /// The in-process result of one `route` call. Distinct from the wire
 /// `ProtocolFrame::RouteResult` plan 09-03 introduces -- this struct is the
 /// internal shape; the wire frame is built from it.
@@ -124,6 +141,53 @@ impl Router {
         *self.last_sync.lock().await
     }
 
+    /// Fire-and-forget model warm-up (plan 09-04 Task 3, RESEARCH Pitfall
+    /// B): one throwaway `embed` call and one throwaway `generate_json`
+    /// call, purely to force Ollama to load both models into memory before
+    /// the first REAL utterance has to pay the measured multi-second
+    /// cold-load cost. Both results are discarded -- only success/failure
+    /// is logged, one line per model. NEVER returns an error and NEVER
+    /// panics: the caller (`orchestratord::main`) is responsible for
+    /// spawning this as an independent task AFTER the listener binds and
+    /// BEFORE `serve` is awaited, so a slow or unreachable Ollama can
+    /// neither delay the daemon's readiness nor fail startup.
+    pub async fn warm_up(&self) {
+        let trivial_input = vec!["warm up".to_string()];
+        match self.client.embed(&self.embed_model, &trivial_input).await {
+            Ok(_) => eprintln!(
+                "orchestratord: router warm-up succeeded for embed model {:?}",
+                self.embed_model
+            ),
+            Err(e) => eprintln!(
+                "orchestratord: router warm-up FAILED for embed model {:?}: {e} (the first real \
+                 request will pay the cold-load cost instead)",
+                self.embed_model
+            ),
+        }
+
+        let trivial_schema = serde_json::json!({
+            "type": "object",
+            "properties": { "ok": { "type": "boolean" } },
+            "required": ["ok"],
+            "additionalProperties": false,
+        });
+        match self
+            .client
+            .generate_json(&self.extract_model, "Respond with {\"ok\": true} and nothing else.", "warm up", &trivial_schema)
+            .await
+        {
+            Ok(_) => eprintln!(
+                "orchestratord: router warm-up succeeded for extract model {:?}",
+                self.extract_model
+            ),
+            Err(e) => eprintln!(
+                "orchestratord: router warm-up FAILED for extract model {:?}: {e} (the first real \
+                 request will pay the cold-load cost instead)",
+                self.extract_model
+            ),
+        }
+    }
+
     /// Fills `def`'s declared parameters from `utterance` via the instruct
     /// model (ROUT-03, plan 09-04). The schema is built from `def.parameters`
     /// ALONE -- never the registry, never any other workflow's parameters or
@@ -150,7 +214,13 @@ impl Router {
     /// boundary). `detail` is always built from `RouterError::
     /// ExtractionRejected`'s `Display` impl, so every failure path names the
     /// offending workflow id in one consistently-worded string.
-    async fn extract_params(
+    ///
+    /// `pub` (plan 09-04 Task 3): `tests/router_extraction.rs`'s opt-in
+    /// model bake-off calls this directly against each installed candidate
+    /// model, isolating the measurement to the ONE thing that varies across
+    /// candidates (structured generation) without also depending on
+    /// embedding-based similarity matching to succeed first.
+    pub async fn extract_params(
         &self,
         def: &WorkflowDefinition,
         utterance: &str,

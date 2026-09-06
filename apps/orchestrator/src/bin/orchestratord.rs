@@ -105,6 +105,16 @@ struct Cli {
     /// strings and incoming utterances with (plan 09-03, ROUT-01).
     #[arg(long, env = "ORCHESTRATOR_EMBED_MODEL", default_value = "nomic-embed-text")]
     embed_model: String,
+
+    /// Ollama instruct model name `Router::extract_params` calls for
+    /// structured parameter extraction (plan 09-04, ROUT-03). Deliberately a
+    /// small local instruct model on the SYNCHRONOUS request path, and
+    /// deliberately NOT the model `ai_summarize`'s AI-agent workflow uses --
+    /// extraction runs inline on every routed utterance with declared
+    /// parameters and must stay small and fast, unlike the AI-agent
+    /// handler's own asynchronous, unattended `claude -p` runs.
+    #[arg(long, env = "ORCHESTRATOR_EXTRACT_MODEL", default_value = "llama3.2:3b")]
+    extract_model: String,
 }
 
 /// How many days of on-disk activity history are rebuilt/retained across a
@@ -259,8 +269,8 @@ async fn main() -> std::io::Result<()> {
     // immediately, mirroring every other resolved-path startup log line in
     // this function.
     eprintln!(
-        "orchestratord: router resolved to Ollama base URL {:?} with embed model {:?}",
-        cli.ollama_url, cli.embed_model
+        "orchestratord: router resolved to Ollama base URL {:?} with embed model {:?} and extract model {:?}",
+        cli.ollama_url, cli.embed_model, cli.extract_model
     );
     let ollama_client: Arc<dyn orchestrator::router::ollama_client::OllamaApi> = Arc::new(
         orchestrator::router::ollama_client::HttpOllamaClient::new(cli.ollama_url.clone()),
@@ -268,16 +278,13 @@ async fn main() -> std::io::Result<()> {
     let router = Arc::new(orchestrator::router::Router::new(
         ollama_client,
         cli.embed_model.clone(),
-        // TODO(plan 09-04 Task 3): replace this literal with a resolved
-        // `--extract-model`/`ORCHESTRATOR_EXTRACT_MODEL` flag, mirroring
-        // `--embed-model`'s own shape exactly.
-        "llama3.2:3b",
+        cli.extract_model.clone(),
     ));
 
     let orchestrator = Arc::new(InProcessOrchestrator::with_router(
         &cli.workflows_dir,
         handlers,
-        router,
+        router.clone(),
     ));
 
     // Loopback-only bind (T-04-05) -- the listener address is never derived
@@ -285,6 +292,16 @@ async fn main() -> std::io::Result<()> {
     // the D-02 port.
     let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, cli.port)).await?;
     eprintln!("orchestratord listening on {}", listener.local_addr()?);
+
+    // Router warm-up (plan 09-04 Task 3, RESEARCH Pitfall B): fire-and-forget
+    // on a spawned task placed AFTER the listener binds and BEFORE `serve`
+    // is awaited, so a slow or unreachable Ollama can neither delay the
+    // daemon's readiness nor fail startup. Measured cold-load cost is
+    // roughly five seconds on the FIRST call to a not-yet-resident model --
+    // worth removing from whichever real request happens to be first.
+    tokio::spawn(async move {
+        router.warm_up().await;
+    });
 
     orchestrator::server::serve(listener, orchestrator, activity_registry).await;
 

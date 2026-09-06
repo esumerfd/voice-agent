@@ -9,6 +9,12 @@
 //! Drives `Router::route` directly over a `TempDir` registry of fixture
 //! workflows and a configurable mock `OllamaApi` -- no `#[ignore]`, no live
 //! Ollama, no environment variable required for any test in this file.
+//!
+//! Plan 09-04 Task 3 adds ONE additional, double-gated LIVE test at the
+//! bottom of this file (the extraction-model bake-off) -- mirroring
+//! `tests/live_agent_eval.rs`'s/`tests/router_calibration.rs`'s identical
+//! `#[ignore]` + opt-in-env-var convention. That one test is the only thing
+//! in this file that ever touches a real Ollama server.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -19,7 +25,8 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use tempfile::TempDir;
 
-use orchestrator::router::ollama_client::OllamaApi;
+use orchestrator::definition::{ParameterSpec, ParameterType, ServiceMode, ServiceSpec, WorkflowDefinition};
+use orchestrator::router::ollama_client::{HttpOllamaClient, OllamaApi};
 use orchestrator::router::Router;
 use orchestrator::{Registry, RouterError};
 
@@ -315,5 +322,141 @@ async fn an_extraction_failure_never_changes_matched_workflow_id_score_or_confir
         success_outcome.extracted_params, failure_outcome.extracted_params,
         "the SUCCESS run must carry parameters and the FAILURE run must not, or the equality \
          assertions above would be vacuous"
+    );
+}
+
+// -----------------------------------------------------------------
+// Plan 09-04, Task 3: opt-in extraction-model bake-off (live Ollama)
+// -----------------------------------------------------------------
+//
+// Double-gated exactly like `live_agent_eval.rs`/`router_calibration.rs`:
+// the `#[ignore]` attribute AND this opt-in variable are BOTH required --
+// the attribute alone would still run under `--include-ignored`; the
+// variable alone would still run if someone deleted the attribute. Never
+// wired into automated continuous integration.
+
+/// The opt-in environment variable gating the one live test below.
+const EXTRACTION_LIVE_OPT_IN_VAR: &str = "WK_ROUTER_EXTRACTION_LIVE";
+
+/// Matches `orchestratord`'s own `--ollama-url` default -- never a value
+/// invented independently here.
+const LIVE_OLLAMA_BASE_URL: &str = "http://127.0.0.1:11434";
+
+/// Matches `orchestratord`'s own `--embed-model` default. Unused by
+/// extraction itself, but `Router::new` requires one.
+const LIVE_EMBED_MODEL: &str = "nomic-embed-text";
+
+/// Matches `orchestratord`'s own `--extract-model` default (plan 09-04) --
+/// the ONE model this bake-off's real assertion is scoped to. Every other
+/// candidate below is a printed measurement only.
+const DEFAULT_EXTRACT_MODEL: &str = "llama3.2:3b";
+
+/// The full candidate list from 09-RESEARCH.md's Open Question 1. This
+/// bake-off measures whichever of these happen to already be installed
+/// (`ollama list`) and NEVER pulls one -- an absent candidate is a printed
+/// skip row, never a failure.
+const CANDIDATE_MODELS: [&str; 3] = ["llama3.2:3b", "phi4-mini", "qwen2.5:3b-instruct"];
+
+/// A `set_timer`-shaped fixture definition with one required int parameter
+/// -- built directly, with no registry or embedding call involved. The
+/// bake-off calls `Router::extract_params` directly (not `route()`),
+/// isolating the measurement to the ONE thing that varies across candidate
+/// models: structured generation.
+fn bakeoff_definition() -> WorkflowDefinition {
+    let mut parameters = HashMap::new();
+    parameters.insert(
+        "duration_minutes".to_string(),
+        ParameterSpec {
+            type_: ParameterType::Int,
+            description: Some("how many minutes the timer should run for".to_string()),
+            required: true,
+        },
+    );
+    WorkflowDefinition {
+        id: "set_timer".to_string(),
+        name: "Set Timer".to_string(),
+        description: String::new(),
+        parameters,
+        service: ServiceSpec {
+            type_: Some("action".to_string()),
+            handler: "timers.start".to_string(),
+            mode: ServiceMode::Sync,
+            command: None,
+            args: Vec::new(),
+            agent: None,
+        },
+        source_path: std::path::PathBuf::from("bakeoff.md"),
+        intent: "set a timer for a given number of minutes and notify me when the time is up"
+            .to_string(),
+        triggers: Vec::new(),
+    }
+}
+
+#[ignore]
+#[tokio::test]
+async fn extraction_model_bake_off_measures_every_installed_candidate_against_the_default() {
+    if std::env::var(EXTRACTION_LIVE_OPT_IN_VAR).as_deref() != Ok("1") {
+        println!(
+            "SKIP: set {EXTRACTION_LIVE_OPT_IN_VAR}=1 to run the extraction-model bake-off \
+             against a live local Ollama server. See 09-04-PLAN.md."
+        );
+        return;
+    }
+
+    let ollama_list_output = std::process::Command::new("ollama")
+        .arg("list")
+        .output()
+        .expect("failed to run `ollama list` -- is Ollama installed and on PATH?");
+    let installed = String::from_utf8_lossy(&ollama_list_output.stdout);
+
+    let def = bakeoff_definition();
+    let utterance = "set a timer for twenty five minutes";
+    let expected = json!({"duration_minutes": 25});
+
+    println!(
+        "\n{:<24} {:>14} {:>8}  {}",
+        "model", "duration_ms", "matched", "extracted (detail on failure)"
+    );
+    let mut default_result: Option<Value> = None;
+    let mut default_was_installed = false;
+
+    for candidate in CANDIDATE_MODELS {
+        if !installed.contains(candidate) {
+            println!("{candidate:<24} {:>14} {:>8}  (not installed -- skipped, never pulled)", "-", "-");
+            continue;
+        }
+
+        let client: Arc<dyn OllamaApi> = Arc::new(HttpOllamaClient::new(LIVE_OLLAMA_BASE_URL));
+        let router = Router::new(client, LIVE_EMBED_MODEL, candidate);
+
+        let start = std::time::Instant::now();
+        let (extracted, detail) = router.extract_params(&def, utterance).await;
+        let elapsed_ms = start.elapsed().as_millis();
+
+        let matched = extracted.as_ref() == Some(&expected);
+        println!(
+            "{candidate:<24} {elapsed_ms:>14} {:>8}  {:?}{}",
+            matched,
+            extracted,
+            detail.map(|d| format!(" (detail: {d})")).unwrap_or_default()
+        );
+
+        if candidate == DEFAULT_EXTRACT_MODEL {
+            default_result = extracted;
+            default_was_installed = true;
+        }
+    }
+
+    assert!(
+        default_was_installed,
+        "the configured default extraction model ({DEFAULT_EXTRACT_MODEL}) is not in `ollama \
+         list` -- this bake-off cannot measure its own default"
+    );
+    assert_eq!(
+        default_result,
+        Some(expected),
+        "expected the CONFIGURED DEFAULT model ({DEFAULT_EXTRACT_MODEL}) to extract the exact \
+         expected value -- this is the bake-off's one real gate; every other candidate above is \
+         a printed measurement only, never an assertion"
     );
 }
