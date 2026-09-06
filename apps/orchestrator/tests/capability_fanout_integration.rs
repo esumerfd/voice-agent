@@ -152,6 +152,19 @@ async fn recv_res(ws: &mut WsStream) -> Envelope {
     }
 }
 
+/// Receives frames until an `Envelope::Protocol` arrives, skipping any
+/// `Envelope::Activity` frames interleaved ahead of it (e.g. a replay burst
+/// delivered right after a reconnect, before the `DescribeRun` reply this
+/// helper is waiting for).
+async fn recv_protocol(ws: &mut WsStream) -> Envelope {
+    loop {
+        let envelope = recv(ws).await;
+        if matches!(envelope, Envelope::Protocol { .. }) {
+            return envelope;
+        }
+    }
+}
+
 /// Receives frames until an `Envelope::Activity` for `run_id` reaching a
 /// terminal (`Success`/`Failure`) status is observed, skipping every other
 /// frame in between.
@@ -270,4 +283,119 @@ async fn owner_declaring_speech_sees_the_gated_field_while_the_bystander_sees_on
         bystander_saw_no_event,
         "expected the bystander to receive no Envelope::Event at all for a run it did not start"
     );
+}
+
+/// Task 2 (D-04): a client connecting AFTER a gated-field run has already
+/// completed is replayed that run's `Activity` frame on connect -- the
+/// replay burst must be filtered exactly like the live broadcast is. A
+/// client declaring no capabilities sees the ungated key but never the
+/// gated one in the replayed detail.
+#[tokio::test]
+async fn replay_burst_for_a_client_declaring_nothing_omits_the_gated_field_from_a_completed_run() {
+    let dir = TempDir::new().expect("failed to create tempdir");
+    write_workflow(dir.path(), "speak_it.md", SPEECH_WORKFLOW);
+    let port = spawn_server(dir.path(), speech_handlers()).await;
+
+    // First connection: owner declares speech, runs the workflow to
+    // completion, then disconnects.
+    let mut owner = connect(port).await;
+    hello(&mut owner, "voice-front-end", vec![shared::CAPABILITY_SPEECH.to_string()]).await;
+    send(&mut owner, &invoke_speak_it(1)).await;
+    let run_id = match recv_res(&mut owner).await {
+        Envelope::Res {
+            payload: ResponsePayload::InvokeWorkflow(resp),
+            ..
+        } => resp.run_id.expect("expected a Some(run_id) on the Started ack"),
+        other => panic!("expected a Started ack, got: {other:?}"),
+    };
+    let _ = recv_terminal_activity_for(&mut owner, &run_id).await;
+    drop(owner);
+
+    // Second connection, arriving AFTER the run is already complete,
+    // declares nothing -- its replay burst must still be filtered.
+    let mut late_client = connect(port).await;
+    hello(&mut late_client, "orchestrator-tui", Vec::new()).await;
+
+    let replayed = tokio::time::timeout(
+        Duration::from_secs(5),
+        recv_terminal_activity_for(&mut late_client, &run_id),
+    )
+    .await
+    .expect("expected the late-connecting client's replay burst to include the completed run");
+
+    let detail = replayed
+        .log
+        .last()
+        .and_then(|entry| entry.detail.clone())
+        .expect("expected a terminal log entry with Some(detail)");
+    assert_eq!(detail["text"], json!("hello from claudette"));
+    assert!(
+        detail.get("speech").is_none(),
+        "expected the replay burst to omit the gated speech key for a client declaring nothing, got: {detail:?}"
+    );
+}
+
+/// Task 2 (D-04): a client that invokes an async gated-field run, disconnects
+/// before it terminates, then reconnects declaring the speech capability and
+/// asks for the run via `DescribeRun`, gets back a `RunDescription` carrying
+/// the gated key -- recovery honors the RECONNECTING connection's own
+/// declaration, not whatever the original connection declared (in this case,
+/// identical, but the point is the reply is filtered fresh each time).
+#[tokio::test]
+async fn describe_run_recovery_for_a_reconnecting_client_declaring_speech_carries_the_gated_field() {
+    let dir = TempDir::new().expect("failed to create tempdir");
+    write_workflow(dir.path(), "speak_it.md", SPEECH_WORKFLOW);
+    let port = spawn_server(dir.path(), speech_handlers()).await;
+
+    let mut owner = connect(port).await;
+    hello(&mut owner, "voice-front-end", vec![shared::CAPABILITY_SPEECH.to_string()]).await;
+    send(&mut owner, &invoke_speak_it(1)).await;
+    let run_id = match recv_res(&mut owner).await {
+        Envelope::Res {
+            payload: ResponsePayload::InvokeWorkflow(resp),
+            ..
+        } => resp.run_id.expect("expected a Some(run_id) on the Started ack"),
+        other => panic!("expected a Started ack, got: {other:?}"),
+    };
+
+    // Disconnect before the run reaches a terminal state.
+    drop(owner);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // Reconnect on a FRESH connection, declaring speech again.
+    let mut reconnected = connect(port).await;
+    hello(&mut reconnected, "voice-front-end", vec![shared::CAPABILITY_SPEECH.to_string()]).await;
+
+    send(
+        &mut reconnected,
+        &Envelope::Protocol {
+            id: 1,
+            frame: ProtocolFrame::DescribeRun {
+                run_id: run_id.clone(),
+            },
+        },
+    )
+    .await;
+
+    match recv_protocol(&mut reconnected).await {
+        Envelope::Protocol {
+            frame: ProtocolFrame::RunDescription { found, event, .. },
+            ..
+        } => {
+            assert!(found, "expected found: true for a completed run recovered by run_id");
+            let event = event.expect("expected Some(event) when found is true");
+            let detail = event
+                .log
+                .last()
+                .and_then(|entry| entry.detail.clone())
+                .expect("expected a terminal log entry with Some(detail)");
+            assert_eq!(detail["text"], json!("hello from claudette"));
+            assert_eq!(
+                detail["speech"],
+                json!({"audio": "base64-encoded-audio"}),
+                "expected the reconnecting connection's own speech declaration to unlock the gated field, got: {detail:?}"
+            );
+        }
+        other => panic!("expected Envelope::Protocol(RunDescription), got: {other:?}"),
+    }
 }

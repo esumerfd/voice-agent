@@ -198,9 +198,13 @@ async fn handle_connection(
     // Replay burst (D-01, RESEARCH Pattern 2): send the registry's current
     // activity snapshot to THIS connection's own write path before it is
     // registered for live broadcast below -- a newly-connecting client
-    // always sees history before any live update, never the reverse.
-    for event in activity_registry.snapshot_as_events() {
-        send_frame(&write, &event).await;
+    // always sees history before any live update, never the reverse. Phase
+    // 8 (plan 08-03, D-04): each replayed event is filtered through THIS
+    // connecting client's own bounded `capabilities` before it is sent --
+    // replay must never become a way around live filtering.
+    for event in activity_registry.snapshot() {
+        let filtered = filter_activity_event_for(&event, &capabilities);
+        send_frame(&write, &Envelope::Activity { event: filtered }).await;
     }
 
     let (tx, mut rx) = mpsc::unbounded_channel::<Envelope>();
@@ -426,7 +430,7 @@ async fn dispatch_envelope(
         // handled-error, keep-serving treatment as every other stray-frame
         // arm above, never a dropped connection.
         Envelope::Protocol { id, frame } => {
-            handle_protocol_frame(id, frame, activity_registry, write).await;
+            handle_protocol_frame(id, frame, activity_registry, write, capabilities).await;
         }
     }
 }
@@ -656,15 +660,24 @@ async fn send_res(write: &Arc<Mutex<WsWrite>>, id: u64, payload: ResponsePayload
 /// (T-08-02/T-08-03). `Welcome`/`RunDescription` arriving FROM a client are
 /// server-push-only misuse (T-08-03): answered with the existing graceful
 /// `ServerError::UnexpectedFrameType` treatment, connection kept alive.
+///
+/// Phase 8 plan 08-03 (D-04): the recovered `event`, when found, is filtered
+/// through `capabilities` -- the REQUESTING connection's own declared
+/// capabilities, which may differ from whatever the run's original owner
+/// declared -- before it is placed in the `RunDescription` reply. Recovery
+/// must never become a way around live filtering.
 async fn handle_protocol_frame(
     id: u64,
     frame: ProtocolFrame,
     activity_registry: &Arc<ActivityRegistry>,
     write: &Arc<Mutex<WsWrite>>,
+    capabilities: &[String],
 ) {
     match frame {
         ProtocolFrame::DescribeRun { run_id } => {
-            let event = activity_registry.get(&run_id);
+            let event = activity_registry
+                .get(&run_id)
+                .map(|event| filter_activity_event_for(&event, capabilities));
             let found = event.is_some();
             send_protocol(
                 write,

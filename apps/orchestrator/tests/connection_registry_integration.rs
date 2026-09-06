@@ -1,9 +1,17 @@
-//! Wave-0 integration test (D-01): proves the daemon's cross-connection
-//! broadcast wiring -- a second connected client receives the same
-//! terminal `Envelope::Event` as the connection that started an async run,
-//! and a disconnected third connection never blocks or breaks delivery to
-//! the survivor (Pitfall 1/2). Mirrors `ws_server_integration.rs`'s
-//! in-process daemon harness, driving multiple simultaneous connections.
+//! Wave-0 integration test, superseded in part by Phase 8 plan 08-03
+//! (D-03/D-04): this file originally proved that BOTH connected clients
+//! received the SAME broadcast terminal `Envelope::Event` for a run either
+//! one started -- the pre-Phase-8 "every client sees every activity"
+//! broadcast contract. D-03 replaces that: the terminal `Event` is now
+//! delivered addressed ONLY to the connection that started the run, never
+//! broadcast to every connection. D-04 keeps the OTHER property this file
+//! also proves: the shared `Activity` lifecycle broadcast still reaches
+//! every connection, terminal phase and all, so a connection that did not
+//! start a run still sees that it happened and how it ended -- just not its
+//! addressed result. `disconnecting_one_of_two_clients_...` below is
+//! unaffected by either decision: its surviving connection IS the run's
+//! owner, so it still receives the addressed terminal Event exactly as
+//! before (Pitfall 1/2 still hold).
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -110,13 +118,46 @@ async fn hello(ws: &mut WsStream, client_name: &str) {
         ws,
         &Envelope::Hello {
             client_name: client_name.to_string(),
+            capabilities: Vec::new(),
         },
     )
     .await;
 }
 
+/// Receives frames on `ws` WITHOUT skipping `Envelope::Activity` (unlike
+/// `recv` above) until an Activity frame for `run_id` reaches a terminal
+/// (`Success`/`Failure`) status -- used by the D-04 observer assertion
+/// below, which needs to see the very frames `recv` discards.
+async fn recv_terminal_activity_for(ws: &mut WsStream, run_id: &str) -> shared::ActivityEvent {
+    loop {
+        let msg = ws
+            .next()
+            .await
+            .expect("expected a frame before the stream ended")
+            .expect("expected a valid WS message");
+        let text = msg.to_text().expect("expected a text frame");
+        let envelope: Envelope = serde_json::from_str(text).expect("expected a valid Envelope");
+        if let Envelope::Activity { event } = envelope {
+            if event.run_id == run_id
+                && matches!(
+                    event.status,
+                    shared::ActivityStatus::Success | shared::ActivityStatus::Failure
+                )
+            {
+                return event;
+            }
+        }
+    }
+}
+
+/// Phase 8 plan 08-03 (D-03/D-04) contract: the terminal `Envelope::Event`
+/// reaches ONLY the connection that started the run; a second connected
+/// client that did not start it still sees the run's shared `Activity`
+/// lifecycle reach a terminal phase, but never receives the addressed
+/// terminal Event itself.
 #[tokio::test]
-async fn fanout_delivers_the_same_broadcast_event_to_a_second_connected_client() {
+async fn terminal_event_reaches_only_the_run_owner_while_the_observer_still_sees_the_activity_lifecycle(
+) {
     let dir = TempDir::new().expect("failed to create tempdir");
     write_workflow(dir.path(), "async_timer.md", ASYNC_TIMER_WORKFLOW);
 
@@ -142,38 +183,61 @@ async fn fanout_delivers_the_same_broadcast_event_to_a_second_connected_client()
     send(&mut runner, &req).await;
 
     // Consume the immediate Started ack on the invoking connection.
-    let _ack = recv(&mut runner).await;
+    let ack = recv(&mut runner).await;
+    let run_id = match ack {
+        Envelope::Res {
+            payload: ResponsePayload::InvokeWorkflow(resp),
+            ..
+        } => resp.run_id.expect("expected a Some(run_id) on the Started ack"),
+        other => panic!("expected a Started ack, got: {other:?}"),
+    };
 
+    // D-03: the owner receives the addressed terminal Event.
     let runner_event = tokio::time::timeout(Duration::from_secs(5), recv(&mut runner))
         .await
-        .expect("expected the invoking connection to receive the terminal event");
-    let observer_event = tokio::time::timeout(Duration::from_secs(5), recv(&mut observer))
-        .await
-        .expect(
-            "expected the OTHER connected client to also receive the terminal event (D-01 fan-out)",
-        );
-
-    for (label, event) in [("runner", runner_event), ("observer", observer_event)] {
-        match event {
-            Envelope::Event {
-                id,
-                payload: ResponsePayload::InvokeWorkflow(resp),
-            } => {
-                assert_eq!(
-                    id, 1,
-                    "expected the event id to match the original req id ({label})"
-                );
-                assert_eq!(
-                    resp.status,
-                    InvokeStatus::Completed,
-                    "expected a Completed terminal status ({label}), got: {resp:?}"
-                );
-            }
-            other => panic!(
-                "expected an Envelope::Event with a Completed InvokeWorkflow payload ({label}), got: {other:?}"
-            ),
+        .expect("expected the invoking connection to receive its addressed terminal event");
+    match runner_event {
+        Envelope::Event {
+            id,
+            payload: ResponsePayload::InvokeWorkflow(resp),
+        } => {
+            assert_eq!(id, 1, "expected the event id to match the original req id");
+            assert_eq!(
+                resp.status,
+                InvokeStatus::Completed,
+                "expected a Completed terminal status, got: {resp:?}"
+            );
         }
+        other => panic!(
+            "expected an Envelope::Event with a Completed InvokeWorkflow payload, got: {other:?}"
+        ),
     }
+
+    // D-04: the observer still sees the run's shared Activity lifecycle
+    // reach a terminal phase...
+    let observer_activity = tokio::time::timeout(
+        Duration::from_secs(5),
+        recv_terminal_activity_for(&mut observer, &run_id),
+    )
+    .await
+    .expect("expected the observer to still see the run's Activity lifecycle reach a terminal phase");
+    assert_eq!(observer_activity.run_id, run_id);
+
+    // ...but D-03: the observer never receives a terminal Event for a run
+    // it did not start, within a bounded wait.
+    let observer_saw_no_event = tokio::time::timeout(Duration::from_millis(500), async {
+        loop {
+            if let Envelope::Event { .. } = recv(&mut observer).await {
+                return true;
+            }
+        }
+    })
+    .await
+    .is_err();
+    assert!(
+        observer_saw_no_event,
+        "expected the observer to receive no Envelope::Event at all for a run it did not start (D-03)"
+    );
 }
 
 #[tokio::test]

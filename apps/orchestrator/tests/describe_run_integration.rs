@@ -103,6 +103,7 @@ async fn hello(ws: &mut WsStream, client_name: &str) {
         ws,
         &Envelope::Hello {
             client_name: client_name.to_string(),
+            capabilities: Vec::new(),
         },
     )
     .await;

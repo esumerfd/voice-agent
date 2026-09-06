@@ -181,13 +181,22 @@ impl ActivityRegistry {
         }
     }
 
-    /// One `Envelope::Activity` per known activity (D-01).
+    /// A clone of every known activity's current `ActivityEvent`, in no
+    /// particular order (Phase 8 plan 08-03, D-04): the FILTERABLE form the
+    /// server needs so a per-recipient replay burst can pass each one
+    /// through `shared::filter_activity_event_for` before it ever reaches a
+    /// connection -- unlike `snapshot_as_events` below, this carries no
+    /// `Envelope` wrapper baked in yet.
+    pub fn snapshot(&self) -> Vec<ActivityEvent> {
+        self.activities.lock().unwrap().values().cloned().collect()
+    }
+
+    /// One `Envelope::Activity` per known activity (D-01), expressed in
+    /// terms of `snapshot` above so there is one source of truth for "every
+    /// known activity's current event".
     pub fn snapshot_as_events(&self) -> Vec<Envelope> {
-        self.activities
-            .lock()
-            .unwrap()
-            .values()
-            .cloned()
+        self.snapshot()
+            .into_iter()
             .map(|event| Envelope::Activity { event })
             .collect()
     }
