@@ -79,6 +79,39 @@ pub enum RuntimeError {
     Timeout { seconds: u64 },
 }
 
+/// Router failures (Phase 9, ROUT-01): every Ollama HTTP/embedding failure
+/// degrades to one of these variants, never a panic and never an
+/// `.unwrap()` on anything the network handed back -- mirrors
+/// `RuntimeError`'s "never crash on a subprocess failure" convention for
+/// this crate's second network/process I/O boundary. Every variant names
+/// the offending endpoint/model, matching this module's documented style.
+#[derive(Error, Debug, Clone, PartialEq)]
+pub enum RouterError {
+    #[error("cannot reach Ollama at {base_url}: {detail}")]
+    OllamaUnreachable { base_url: String, detail: String },
+
+    #[error("Ollama model `{model}` not available: {detail}")]
+    ModelNotFound { model: String, detail: String },
+
+    #[error("Ollama request to {endpoint} timed out after {seconds}s")]
+    Timeout { endpoint: String, seconds: u64 },
+
+    #[error("Ollama returned an unparseable response from {endpoint}: {detail}")]
+    MalformedResponse { endpoint: String, detail: String },
+
+    /// A cached workflow-intent embedding and the utterance embedding (or
+    /// two Ollama responses) carried different vector lengths -- never
+    /// compared as numbers (ROUT-02 precision probe).
+    #[error(
+        "Ollama model `{model}` returned mismatched embedding dimensions (expected {expected}, got {got})"
+    )]
+    DimensionMismatch {
+        model: String,
+        expected: usize,
+        got: usize,
+    },
+}
+
 /// Payload-validation failures (D-07): a JSON payload checked against a
 /// workflow's `ParameterSpec` before any handler runs.
 #[derive(Error, Debug, Clone, PartialEq, Eq)]

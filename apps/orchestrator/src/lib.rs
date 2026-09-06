@@ -10,6 +10,7 @@ pub mod dispatch;
 pub mod error;
 pub mod handlers;
 pub mod registry;
+pub mod router;
 pub mod runtime;
 pub mod server;
 pub mod service;
@@ -21,7 +22,9 @@ pub use dispatch::{
     dispatch, validate_payload, InvokeOutcome, ENVELOPE_AGENT_KEY, ENVELOPE_ARGS_KEY,
     ENVELOPE_COMMAND_KEY,
 };
-pub use error::{CreateError, DeleteError, DispatchError, LoadError, ServerError, ValidationError};
+pub use error::{
+    CreateError, DeleteError, DispatchError, LoadError, RouterError, ServerError, ValidationError,
+};
 pub use registry::Registry;
 pub use service::{RunHandle, RunStatus, Service, ServiceError};
 pub use shared::{
