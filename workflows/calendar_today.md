@@ -1,6 +1,7 @@
 ---
 id: calendar_today
 name: Calendar Today
+intent: check what is on today's calendar and what is scheduled for the rest of the day
 parameters: {}
 service:
   type: integration

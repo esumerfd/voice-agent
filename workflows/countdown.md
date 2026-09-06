@@ -1,6 +1,7 @@
 ---
 id: countdown
 name: Countdown
+intent: count down out loud from three to go as a spoken start signal
 parameters:
 service:
   type: action

@@ -1,6 +1,7 @@
 ---
 id: ai_summarize
 name: AI Summarize
+intent: read the staged reference material and write a concise written summary of it
 parameters:
   focus:
     type: string

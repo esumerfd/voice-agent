@@ -152,15 +152,18 @@ fn a_crafted_intent_with_yaml_control_characters_reloads_as_one_unchanged_scalar
     );
 }
 
-/// Task 2 (backward compatibility): every workflow `.md` file committed
-/// before Phase 8 loads with zero `LoadError`s and resolves to an empty
-/// `intent` and an empty `triggers` -- a warning-free load is the criterion,
-/// not merely a count of loaded definitions. Located relative to
+/// Phase 9 (D-04): every shipped workflow `.md` file now declares a
+/// non-empty, trimmed `intent` sentence authored against its real behaviour
+/// -- the calibration corpus (`router_calibration/fixtures.rs`) is measured
+/// against these exact values, so a load that silently resolves an intent
+/// back to empty (a renamed/reverted `intent:` key) must fail loudly here,
+/// naming the offending id. `triggers` remains untouched by this phase and
+/// still resolves to the empty non-breaking default. Located relative to
 /// `CARGO_MANIFEST_DIR` (mirrors `registry_integration.rs`'s existing
 /// `real_workflows_directory_loads_with_zero_errors_and_all_four_ids_present`
 /// precedent) rather than a hardcoded absolute path.
 #[test]
-fn real_workflows_directory_loads_with_zero_errors_and_empty_intent_and_triggers() {
+fn real_workflows_directory_loads_with_zero_errors_and_every_workflow_declares_an_intent() {
     let workflows_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../workflows");
 
     let (registry, errors) = Registry::load(&workflows_dir);
@@ -180,14 +183,14 @@ fn real_workflows_directory_loads_with_zero_errors_and_empty_intent_and_triggers
         let def = registry
             .lookup(id)
             .unwrap_or_else(|| panic!("expected {id} to resolve via lookup"));
-        assert_eq!(
-            def.intent, "",
-            "expected pre-Phase-8 workflow {id} to resolve to an empty intent, got: {:?}",
+        assert!(
+            !def.intent.trim().is_empty(),
+            "expected shipped workflow {id} to declare a non-empty intent (D-04), got: {:?}",
             def.intent
         );
         assert!(
             def.triggers.is_empty(),
-            "expected pre-Phase-8 workflow {id} to resolve to an empty triggers list, got: {:?}",
+            "expected shipped workflow {id} to resolve to an empty triggers list (untouched by this phase), got: {:?}",
             def.triggers
         );
     }
