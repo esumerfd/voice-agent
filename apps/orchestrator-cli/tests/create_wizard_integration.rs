@@ -26,6 +26,7 @@ mod ws_client;
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::path::Path;
+use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 
@@ -656,4 +657,113 @@ async fn second_create_with_the_same_id_reprompts_only_the_id() {
     assert!(dir.path().join("existing_id_2.md").exists());
     // The original workflow is untouched -- this was never an overwrite.
     assert!(dir.path().join("existing_id.md").exists());
+}
+
+// ---------------------------------------------------------------------
+// Task 3: main.rs/cli.rs dispatch wiring (compiled-binary harness)
+// ---------------------------------------------------------------------
+
+/// Runs the built `orchestrator` binary with the given CLI args and an
+/// explicitly controlled stdin, mirroring `create_integration.rs::
+/// run_orchestrator` but with `stdin` overridable so a closed-stdin
+/// scenario (EOF on the very first prompt) is deterministic regardless of
+/// what the test harness's own stdin happens to be.
+async fn run_orchestrator_with_stdin(args: &[&str], stdin: Stdio) -> Output {
+    let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+    tokio::task::spawn_blocking(move || {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_orchestrator"));
+        cmd.args(&args);
+        cmd.stdin(stdin);
+        cmd.output().expect("failed to run the orchestrator binary")
+    })
+    .await
+    .expect("run_orchestrator_with_stdin's spawn_blocking task panicked")
+}
+
+/// Guided entry: invoking `workflow create` with no positional args and a
+/// closed stdin exits nonzero via the wizard's own EOF handling, not
+/// clap's "missing required argument" usage error.
+#[tokio::test]
+async fn no_args_and_closed_stdin_exits_via_wizard_eof_not_a_clap_usage_error() {
+    let dir = TempDir::new().expect("failed to create tempdir");
+    let port = spawn_daemon(dir.path(), HashMap::new()).await;
+    let port_str = port.to_string();
+
+    let output = run_orchestrator_with_stdin(&["--port", &port_str, "workflow", "create"], Stdio::null()).await;
+
+    assert!(!output.status.success(), "expected a nonzero exit for closed stdin with no args");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("required arguments were not provided") && !stderr.contains("Usage:"),
+        "expected the wizard's own EOF handling, not a clap usage error, got stderr: {stderr}"
+    );
+}
+
+/// Flag-driven entry unchanged: invoking `workflow create demo "hello"`
+/// with the existing flags still succeeds through the daemon's real write
+/// path -- the existing `create_integration.rs` suite (unmodified) is the
+/// authoritative byte-identical-output check; this test proves the
+/// `Option<String>` positional change did not disturb the both-`Some` path.
+#[tokio::test]
+async fn flag_driven_create_with_both_positionals_still_succeeds() {
+    let dir = TempDir::new().expect("failed to create tempdir");
+    let port = spawn_daemon(dir.path(), HashMap::new()).await;
+    let port_str = port.to_string();
+
+    let output = run_orchestrator_with_stdin(
+        &["--port", &port_str, "workflow", "create", "demo", "hello"],
+        Stdio::null(),
+    )
+    .await;
+
+    assert!(
+        output.status.success(),
+        "expected the flag-driven path to still succeed, got stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(dir.path().join("demo.md").exists());
+}
+
+/// Half-specified rejection: invoking `workflow create demo` with an id
+/// but no source exits nonzero with a message naming that both
+/// positionals are required together, and never silently drops into
+/// guided mode with a pre-filled id.
+#[tokio::test]
+async fn half_specified_positionals_reject_naming_both_required_together() {
+    let dir = TempDir::new().expect("failed to create tempdir");
+    let port = spawn_daemon(dir.path(), HashMap::new()).await;
+    let port_str = port.to_string();
+
+    let output = run_orchestrator_with_stdin(&["--port", &port_str, "workflow", "create", "demo"], Stdio::null()).await;
+
+    assert!(!output.status.success(), "expected a nonzero exit for a half-specified create");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        (stdout.contains("id") && stdout.contains("source")) || (stderr.contains("id") && stderr.contains("source")),
+        "expected a message naming both id and source as required together, got stdout: {stdout}, stderr: {stderr}"
+    );
+    assert!(
+        !dir.path().join("demo.md").exists(),
+        "a half-specified create must never write a pre-filled-id guided result"
+    );
+}
+
+/// Edit unchanged: `workflow edit` still requires both positionals --
+/// `Edit` was NOT changed to `Option<String>`, so clap itself rejects a
+/// half-specified edit at parse time.
+#[tokio::test]
+async fn edit_still_requires_both_positionals() {
+    let dir = TempDir::new().expect("failed to create tempdir");
+    let port = spawn_daemon(dir.path(), HashMap::new()).await;
+    let port_str = port.to_string();
+
+    let output = run_orchestrator_with_stdin(&["--port", &port_str, "workflow", "edit", "demo"], Stdio::null()).await;
+
+    assert!(!output.status.success(), "expected a nonzero exit for a half-specified edit");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("required arguments were not provided") || stderr.contains("Usage:"),
+        "expected clap's own usage error for edit (unchanged positionals), got stderr: {stderr}"
+    );
 }

@@ -36,15 +36,9 @@
 //! sole authority and re-validates every request regardless of what this
 //! module rejects or accepts. Nothing here may weaken or bypass it.
 //!
-//! `#[allow(dead_code)]` below: this module is not yet reached from
-//! `main.rs`'s dispatch -- Task 3 of this plan wires the guided-mode branch
-//! onto `workflow create`'s `Option<String>` positionals. Every item here
-//! IS exercised, from `tests/create_wizard_integration.rs`'s own separate
-//! `#[path]`-included compilation of this file, mirroring `ws_client.rs`'s
-//! identical `pending_protocol`/`events` situation (this crate has no
-//! `[lib]` target, so the bin target and each test binary compile this file
-//! independently).
-#![allow(dead_code)]
+//! Wired into `main.rs`'s `WorkflowCommands::Create` dispatch arm (Task 3):
+//! both `id`/`source` positionals `None` calls `run` below with
+//! `std::io::stdin().lock()`/`std::io::stdout()`.
 
 use std::io::{BufRead, Write};
 
@@ -158,6 +152,20 @@ pub fn validate_id_client(id: &str) -> Result<(), WizardError> {
     Ok(())
 }
 
+/// Client-side mirror of the daemon's display-name length enforcement
+/// (UI-SPEC Step 2): optional -- a blank answer is valid and handled by the
+/// caller before this is ever invoked -- but a GIVEN name must be at most
+/// `MAX_WORKFLOW_NAME_LEN_MIRROR` Unicode code points.
+fn validate_display_name_client(name: &str) -> Result<(), WizardError> {
+    if name.chars().count() > MAX_WORKFLOW_NAME_LEN_MIRROR {
+        return Err(WizardError {
+            field: "name",
+            reason: format!("must be at most {MAX_WORKFLOW_NAME_LEN_MIRROR} characters"),
+        });
+    }
+    Ok(())
+}
+
 /// Client-side mirror of the daemon's intent-length enforcement (UI-SPEC
 /// Step 5): required, non-empty after trim, at most
 /// `MAX_INTENT_LEN_MIRROR` Unicode code points.
@@ -210,14 +218,8 @@ pub async fn run<R: BufRead, W: Write>(client: &dyn WorkflowCreator, input: &mut
         return Ok(1);
     };
 
-    let default_name = derive_display_name(&id);
-    let Some(display_name_raw) = prompt_line(input, out, &format!("Display name [default: {default_name}]:"))? else {
+    let Some(display_name) = prompt_display_name(input, out, &id)? else {
         return Ok(1);
-    };
-    let display_name = if display_name_raw.trim().is_empty() {
-        None
-    } else {
-        Some(display_name_raw.trim().to_string())
     };
 
     let Some(description) = prompt_line(input, out, "Description (workflow body text):")? else {
@@ -378,6 +380,27 @@ fn prompt_id<R: BufRead, W: Write>(input: &mut R, out: &mut W) -> std::io::Resul
     }
 }
 
+/// Step 2: optional -- a blank answer accepts the `derive_display_name(id)`
+/// default (`None`, resolved by the caller at request-build time so a
+/// server-side id change on re-prompt still derives from the CURRENT id).
+/// A given name loops on `validate_display_name_client` until valid.
+fn prompt_display_name<R: BufRead, W: Write>(input: &mut R, out: &mut W, id: &str) -> std::io::Result<Option<Option<String>>> {
+    let default_name = derive_display_name(id);
+    loop {
+        let Some(raw) = prompt_line(input, out, &format!("Display name [default: {default_name}]:"))? else {
+            return Ok(None);
+        };
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Ok(Some(None));
+        }
+        match validate_display_name_client(trimmed) {
+            Ok(()) => return Ok(Some(Some(trimmed.to_string()))),
+            Err(err) => writeln!(out, "{}", err.line())?,
+        }
+    }
+}
+
 /// Step 5: loops on `validate_intent_client` until a valid intent is
 /// entered.
 fn prompt_intent<R: BufRead, W: Write>(input: &mut R, out: &mut W) -> std::io::Result<Option<String>> {
@@ -440,6 +463,13 @@ fn parse_trigger_selection(raw: &str) -> Vec<String> {
         let Some(choice) = TRIGGER_CHOICES.get(index) else {
             continue;
         };
+        // Client-side mirror of the daemon's MAX_TRIGGERS cap. Unreachable
+        // today (TRIGGER_CHOICES has only 2 entries), but this is the
+        // correct defensive bound if the fixed checklist ever grows, and
+        // matches the daemon's own enforcement for the same list.
+        if result.len() >= MAX_TRIGGERS_MIRROR {
+            break;
+        }
         if !result.iter().any(|t| t == choice) {
             result.push((*choice).to_string());
         }
@@ -610,6 +640,7 @@ fn render_review<W: Write>(out: &mut W, answers: &WizardAnswers) -> std::io::Res
     )?;
     writeln!(out, "  triggers: {}", answers.triggers.join(", "))?;
     writeln!(out, "  intent: {}", answers.intent)?;
+    writeln!(out, "  handler: {}", handler_label(answers.handler))?;
     if answers.parameters.is_empty() {
         writeln!(out, "Parameters: none")?;
     } else {
@@ -625,6 +656,16 @@ fn render_review<W: Write>(out: &mut W, answers: &WizardAnswers) -> std::io::Res
         }
     }
     Ok(())
+}
+
+/// Human-readable handler-type label for the Step 9 review summary.
+fn handler_label(handler: Option<HandlerChoice>) -> &'static str {
+    match handler {
+        Some(HandlerChoice::ScriptAction) => "script-backed action",
+        Some(HandlerChoice::MarkdownAction) => "markdown-body action",
+        Some(HandlerChoice::Agent) => "agent (Claude-backed)",
+        None => "(none)",
+    }
 }
 
 /// Writes `prompt` followed by a newline, then reads one line of answer.

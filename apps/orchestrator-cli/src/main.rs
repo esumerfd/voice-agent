@@ -73,26 +73,46 @@ async fn main() -> std::io::Result<()> {
                     max_budget_usd,
                 },
         } => {
-            let agent_flags = create::AgentFlags {
-                agent,
-                agent_file,
-                timeout_secs,
-                max_budget_usd,
+            // Two entry paths (plan 10-01, D-01): both Some uses the
+            // existing flag-driven path unchanged; both None enters the
+            // guided Q&A flow; a mixed pair is rejected outright -- never
+            // silently falls through to guided mode with a pre-filled id.
+            let code = match (id, source) {
+                (Some(id), Some(source)) => {
+                    let agent_flags = create::AgentFlags {
+                        agent,
+                        agent_file,
+                        timeout_secs,
+                        max_budget_usd,
+                    };
+                    create::run(
+                        &client as &dyn WorkflowCreator,
+                        WorkflowWriteMode::Create,
+                        &id,
+                        &source,
+                        display_name.as_deref(),
+                        description.as_deref(),
+                        &param,
+                        script,
+                        markdown,
+                        &agent_flags,
+                        &mut std::io::stdout(),
+                    )
+                    .await?
+                }
+                (None, None) => {
+                    create_wizard::run(&client as &dyn WorkflowCreator, &mut std::io::stdin().lock(), &mut std::io::stdout())
+                        .await?
+                }
+                (id, source) => {
+                    eprintln!(
+                        "<id> and <source> must be supplied together (got id: {:?}, source: {:?}) -- \
+                         omit BOTH to enter the guided Q&A flow instead",
+                        id, source
+                    );
+                    1
+                }
             };
-            let code = create::run(
-                &client as &dyn WorkflowCreator,
-                WorkflowWriteMode::Create,
-                &id,
-                &source,
-                display_name.as_deref(),
-                description.as_deref(),
-                &param,
-                script,
-                markdown,
-                &agent_flags,
-                &mut std::io::stdout(),
-            )
-            .await?;
             std::process::exit(code);
         }
         Commands::Workflow {

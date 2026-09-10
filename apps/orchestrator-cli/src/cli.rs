@@ -81,9 +81,17 @@ pub enum WorkflowCommands {
     /// filesystem directly (D-06/D-DISC-01). `<id>` is the workflow id AND
     /// the `.md` filename stem, so `orchestrator run <id>` works
     /// immediately after create (D-DISC-08).
+    ///
+    /// Two entry paths (plan 10-01, D-01): supplying BOTH `<id>` and
+    /// `<source>` uses this flag-driven path unchanged; supplying NEITHER
+    /// enters an interactive guided Q&A flow over stdin/stdout that walks
+    /// through every field below one at a time. Supplying exactly one of
+    /// the two is rejected -- `<id>`/`<source>` are required together or
+    /// not at all, and a half-specified invocation never silently falls
+    /// through to guided mode with a pre-filled id.
     Create {
-        id: String,
-        source: String,
+        id: Option<String>,
+        source: Option<String>,
         /// Overrides the default title-cased `<id>`-derived display name.
         #[arg(long = "display-name")]
         display_name: Option<String>,
