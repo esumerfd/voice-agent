@@ -29,8 +29,10 @@ mod cli;
 mod event;
 mod ui;
 mod wizard;
+mod wizard_dispatch;
 mod ws_client;
 
+use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
 
 use clap::Parser;
@@ -86,6 +88,14 @@ async fn run_loop(
     client: &TuiWsClient,
     port: u16,
 ) {
+    // Phase 10, plan 10-04: records the `Frame::count()` observed by the
+    // wizard's own draw-before-await ordering (`wizard_dispatch::
+    // run_collision_check`) -- a lightweight, always-safe bookkeeping value
+    // with no functional consumer in production; test code reads it to
+    // prove the in-progress draw genuinely happens before the checker call
+    // blocks (T-10-22).
+    let render_count = AtomicUsize::new(0);
+
     loop {
         // Drain whatever Activity events have arrived since the last tick
         // -- the initial replay burst and every subsequent live push both
@@ -127,19 +137,28 @@ async fn run_loop(
             Some(Action::Quit) => break,
             Some(Action::ShowHelp) => app.show_help(),
             Some(Action::CloseHelp) => app.close_help(),
-            // Phase 10, plan 10-03: `event.rs`'s `map_key` produces these
-            // under `Focus::Wizard` (Task 3), but dispatching them into
-            // `App`'s wizard state and rendering the wizard screen are
-            // 10-04's scope, per this plan's explicit boundary -- inert
-            // here for now.
-            Some(
-                Action::OpenWizard
-                | Action::WizardChar(_)
-                | Action::WizardBackspace
-                | Action::WizardAdvance
-                | Action::WizardBack
-                | Action::WizardCancel,
-            ) => {}
+            // Phase 10, plan 10-04: every wizard action gets a real arm --
+            // each one a direct one-line call into `App`/`wizard_dispatch`,
+            // matching this loop's own established discipline. The
+            // heavier logic (the collision gate, the write path) lives in
+            // `wizard_dispatch`, the one module both this loop and
+            // `tests/wizard_render_integration.rs` can drive identically.
+            Some(Action::OpenWizard) => app.open_wizard(),
+            Some(Action::WizardChar(c)) => wizard_dispatch::handle_wizard_char(app, c),
+            Some(Action::WizardBackspace) => {
+                if let Some(wizard) = app.wizard_mut() {
+                    wizard.backspace();
+                }
+            }
+            Some(Action::WizardBack) => {
+                if let Some(wizard) = app.wizard_mut() {
+                    wizard.back();
+                }
+            }
+            Some(Action::WizardCancel) => app.close_wizard(),
+            Some(Action::WizardAdvance) => {
+                wizard_dispatch::handle_wizard_advance(app, client, client, terminal, port, &render_count).await;
+            }
             None => {}
         }
     }

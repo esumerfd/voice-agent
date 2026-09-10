@@ -24,12 +24,15 @@ mod app;
 mod event;
 #[path = "../src/ui.rs"]
 mod ui;
+#[path = "../src/wizard_dispatch.rs"]
+mod wizard_dispatch;
 #[path = "../src/ws_client.rs"]
 mod ws_client;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -42,7 +45,10 @@ use tokio::net::TcpListener;
 use tokio::time::timeout;
 
 use shared::wizard::{HandlerChoice, Step};
-use shared::{IntentCollisionChecker, IntentCollisionReport, ParameterDescriptor, ParameterType, WorkflowCreator};
+use shared::{
+    CreateWorkflowRequest, CreateWorkflowResponse, IntentCollisionChecker, IntentCollisionReport,
+    ParameterDescriptor, ParameterType, ProtocolFrame, WorkflowCreator,
+};
 
 use orchestrator::router::ollama_client::OllamaApi;
 use orchestrator::router::Router;
@@ -449,4 +455,577 @@ fn the_in_progress_line_renders_while_the_collision_check_is_in_flight() {
         "expected the documented in-progress line: {rendered}"
     );
     assert!(!rendered.contains("Save anyway?"), "the in-progress line must not also show a stale prompt");
+}
+
+// =========================================================================
+// Task 3: wiring the loop and same-session routing
+// =========================================================================
+
+// -----------------------------------------------------------------------
+// Task 3 test doubles
+// -----------------------------------------------------------------------
+
+#[derive(Default)]
+struct MockWorkflowCreator {
+    calls: AtomicUsize,
+    last_request: Mutex<Option<CreateWorkflowRequest>>,
+    response: Mutex<Option<CreateWorkflowResponse>>,
+}
+
+impl MockWorkflowCreator {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn with_response(response: CreateWorkflowResponse) -> Self {
+        Self {
+            response: Mutex::new(Some(response)),
+            ..Self::default()
+        }
+    }
+
+    fn calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+
+    fn last_request(&self) -> CreateWorkflowRequest {
+        self.last_request
+            .lock()
+            .expect("mutex poisoned")
+            .clone()
+            .expect("create_workflow should have been called at least once")
+    }
+}
+
+#[async_trait]
+impl WorkflowCreator for MockWorkflowCreator {
+    async fn create_workflow(&self, req: CreateWorkflowRequest) -> CreateWorkflowResponse {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        *self.last_request.lock().expect("mutex poisoned") = Some(req.clone());
+        self.response.lock().expect("mutex poisoned").clone().unwrap_or(CreateWorkflowResponse {
+            created: true,
+            workflow_path: Some(format!("/workflows/{}.md", req.id)),
+            script_path: None,
+            error: None,
+        })
+    }
+}
+
+/// A checker stub returning a queue of canned reports (one per call, in
+/// call order; the queue's final report repeats once exhausted) -- mirrors
+/// `orchestrator-cli/tests/create_wizard_integration.rs::StubIntentCollisionChecker`.
+struct QueueChecker {
+    reports: Mutex<VecDeque<IntentCollisionReport>>,
+}
+
+impl QueueChecker {
+    fn new(reports: Vec<IntentCollisionReport>) -> Self {
+        Self {
+            reports: Mutex::new(reports.into()),
+        }
+    }
+}
+
+#[async_trait]
+impl IntentCollisionChecker for QueueChecker {
+    async fn check_intent_collision(&self, _intent: &str) -> IntentCollisionReport {
+        let mut queue = self.reports.lock().expect("mutex poisoned");
+        if queue.len() > 1 {
+            queue.pop_front().expect("checked len() > 1 above")
+        } else {
+            queue.front().cloned().unwrap_or_else(no_collision_report)
+        }
+    }
+}
+
+/// A checker that also records the shared render-count's value at the exact
+/// moment it is invoked -- the draw-before-await ordering evidence (Task 3
+/// D-2).
+struct RecordingChecker {
+    render_count: Arc<AtomicUsize>,
+    report: IntentCollisionReport,
+    recorded_at_invocation: Mutex<Vec<usize>>,
+}
+
+impl RecordingChecker {
+    fn new(render_count: Arc<AtomicUsize>, report: IntentCollisionReport) -> Self {
+        Self {
+            render_count,
+            report,
+            recorded_at_invocation: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn recorded_at_invocation(&self) -> Vec<usize> {
+        self.recorded_at_invocation.lock().expect("mutex poisoned").clone()
+    }
+}
+
+#[async_trait]
+impl IntentCollisionChecker for RecordingChecker {
+    async fn check_intent_collision(&self, _intent: &str) -> IntentCollisionReport {
+        self.recorded_at_invocation
+            .lock()
+            .expect("mutex poisoned")
+            .push(self.render_count.load(Ordering::SeqCst));
+        self.report.clone()
+    }
+}
+
+/// Drives a fresh, already-open wizard through every plain synchronous step
+/// (id, blank display name, blank description, the `cli` trigger, the given
+/// intent, a markdown-body handler, and a declined add-a-parameter prompt)
+/// directly via `WizardState`'s own mutators -- none of these need a daemon
+/// or checker call. Leaves the wizard on `Step::Parameters` with the
+/// buffer already holding `"n"`, ready for the CALLER to drive the one
+/// ending keypress through the real `wizard_dispatch::handle_wizard_advance`
+/// so the collision-check auto-trigger fires exactly as `run_loop` would.
+fn fill_through_parameters(app: &mut App, id: &str, intent: &str) {
+    let wizard = app.wizard_mut().expect("wizard must be open");
+    for c in id.chars() {
+        wizard.push_char(c);
+    }
+    wizard.advance(); // Id -> DisplayName
+    wizard.advance(); // blank DisplayName -> Description
+    wizard.advance(); // blank Description -> Triggers
+    wizard.toggle_trigger(0); // cli
+    wizard.advance(); // Triggers -> Intent
+    for c in intent.chars() {
+        wizard.push_char(c);
+    }
+    wizard.advance(); // Intent -> HandlerType
+    wizard.select_handler(HandlerChoice::MarkdownAction); // -> Parameters
+    wizard.push_char('n'); // "don't add a parameter"
+}
+
+fn fresh_terminal(width: u16, height: u16) -> Terminal<TestBackend> {
+    Terminal::new(TestBackend::new(width, height)).expect("TestBackend terminal")
+}
+
+// -----------------------------------------------------------------------
+// Task 3: exhaustive Action dispatch coverage
+// -----------------------------------------------------------------------
+
+/// Fails to COMPILE (non-exhaustive match) if a new `Action` variant is
+/// ever added without a case here -- the load-bearing property of this
+/// test, proving every `Action::Wizard*`/`Action::OpenWizard` variant has a
+/// real dispatch path (this file's own tests, or `main.rs`'s `run_loop`
+/// arms for the non-wizard variants, all listed here for one single source
+/// of exhaustiveness truth).
+#[test]
+fn every_action_variant_is_accounted_for_in_dispatch() {
+    fn assert_exhaustive(action: Action) {
+        match action {
+            Action::SelectNext
+            | Action::SelectPrev
+            | Action::SelectFirst
+            | Action::SelectLast
+            | Action::OpenTab
+            | Action::FocusActivities
+            | Action::Quit
+            | Action::ShowHelp
+            | Action::CloseHelp
+            | Action::ScrollDown
+            | Action::ScrollUp
+            | Action::ScrollHalfPageDown
+            | Action::ScrollHalfPageUp
+            | Action::ScrollPageDown
+            | Action::ScrollPageUp
+            | Action::ScrollTop
+            | Action::ScrollBottom
+            | Action::NextTab
+            | Action::PrevTab => {}
+            // The six wizard actions (Phase 10, plan 10-04): each has a
+            // real `run_loop` arm in `main.rs` -- `OpenWizard`/
+            // `WizardBackspace`/`WizardBack`/`WizardCancel` call directly
+            // into `App`/`WizardState`; `WizardChar`/`WizardAdvance` call
+            // into `wizard_dispatch`, exercised directly by this file's
+            // other Task 3 tests.
+            Action::OpenWizard
+            | Action::WizardChar(_)
+            | Action::WizardBackspace
+            | Action::WizardAdvance
+            | Action::WizardBack
+            | Action::WizardCancel => {}
+        }
+    }
+    assert_exhaustive(Action::OpenWizard);
+}
+
+// -----------------------------------------------------------------------
+// Task 3: digit-driven menu/checklist selection (WizardChar dispatch)
+// -----------------------------------------------------------------------
+
+#[test]
+fn wizard_char_toggles_triggers_by_digit_instead_of_typing_them() {
+    let mut app = App::new(10);
+    app.open_wizard();
+    {
+        let wizard = app.wizard_mut().unwrap();
+        for c in "brew-coffee".chars() {
+            wizard.push_char(c);
+        }
+        wizard.advance(); // Id -> DisplayName
+        wizard.advance(); // blank -> Description
+        wizard.advance(); // blank -> Triggers
+    }
+
+    wizard_dispatch::handle_wizard_char(&mut app, '2'); // "voice" -- toggled, not typed
+
+    let wizard = app.wizard().unwrap();
+    assert_eq!(wizard.buffer(), "", "a recognized digit must toggle, never enter the buffer");
+    assert_eq!(wizard.selected_triggers(), &["voice".to_string()]);
+}
+
+#[test]
+fn wizard_char_selects_a_handler_by_digit_and_advances() {
+    let mut app = App::new(10);
+    app.open_wizard();
+    {
+        let wizard = app.wizard_mut().unwrap();
+        for c in "brew-coffee".chars() {
+            wizard.push_char(c);
+        }
+        wizard.advance(); // Id -> DisplayName
+        wizard.advance(); // blank -> Description
+        wizard.advance(); // blank -> Triggers
+        wizard.toggle_trigger(0);
+        wizard.advance(); // -> Intent
+        for c in "brew coffee".chars() {
+            wizard.push_char(c);
+        }
+        wizard.advance(); // -> HandlerType
+    }
+
+    wizard_dispatch::handle_wizard_char(&mut app, '2'); // Markdown-body action
+
+    let wizard = app.wizard().unwrap();
+    assert_eq!(wizard.step(), Step::Parameters, "selecting a handler is itself an advancing action (D-05)");
+    assert_eq!(wizard.answers().handler, Some(HandlerChoice::MarkdownAction));
+}
+
+#[test]
+fn wizard_char_falls_back_to_plain_typing_outside_triggers_and_handler_type() {
+    let mut app = App::new(10);
+    app.open_wizard();
+
+    wizard_dispatch::handle_wizard_char(&mut app, '2'); // Step::Id -- must type, not toggle/select
+
+    assert_eq!(app.wizard().unwrap().buffer(), "2");
+}
+
+// -----------------------------------------------------------------------
+// Task 3: cancel
+// -----------------------------------------------------------------------
+
+#[test]
+fn wizard_cancel_returns_to_activities_preserving_the_prior_selection() {
+    let mut app = App::new(10);
+    app.ingest(shared::ActivityEvent {
+        run_id: "run-1".to_string(),
+        workflow_id: "set_timer".to_string(),
+        client_name: "orchestrator-tui".to_string(),
+        session_id: "sess-1".to_string(),
+        status: shared::ActivityStatus::Success,
+        started_at_ms: 100,
+        log: vec![],
+    });
+    app.select_next();
+    let selected_before = app.selected().unwrap().run_id.clone();
+
+    app.open_wizard();
+    // `main.rs`'s `run_loop` arm for `Action::WizardCancel` is the direct
+    // one-liner `app.close_wizard()` -- exercised as-is here.
+    app.close_wizard();
+
+    assert_eq!(app.focus(), Focus::Activities);
+    assert_eq!(app.selected().unwrap().run_id, selected_before);
+}
+
+// -----------------------------------------------------------------------
+// Task 3: draw-before-await ordering
+// -----------------------------------------------------------------------
+
+#[tokio::test]
+async fn the_collision_check_draws_before_the_checker_await_begins() {
+    let mut app = App::new(10);
+    app.open_wizard();
+    fill_through_parameters(&mut app, "brew-coffee", "brew coffee");
+
+    let mut terminal = fresh_terminal(80, 24);
+    let render_count = Arc::new(AtomicUsize::new(0));
+    let checker = RecordingChecker::new(Arc::clone(&render_count), no_collision_report());
+    let creator = MockWorkflowCreator::new();
+
+    // `Frame::count()` is 0-indexed, so a bare `render_count.load()` before
+    // ANY draw has ever happened is indistinguishable from "the first draw
+    // already happened" (both read 0). Priming with one real draw first
+    // establishes a known, already-incremented baseline to compare against.
+    let _ = terminal.draw(|frame| render_count.store(frame.count(), Ordering::SeqCst));
+    let before_dispatch = render_count.load(Ordering::SeqCst);
+    wizard_dispatch::handle_wizard_advance(&mut app, &creator, &checker, &mut terminal, 47100, render_count.as_ref())
+        .await;
+
+    let recorded = checker.recorded_at_invocation();
+    assert_eq!(recorded.len(), 1, "the checker must be invoked exactly once");
+    assert!(
+        recorded[0] > before_dispatch,
+        "the render count observed AT CHECKER-INVOCATION time ({recorded:?}) must be strictly greater than its \
+         value before the collision-check dispatch began ({before_dispatch}) -- proving a draw happened before \
+         the await, not after"
+    );
+}
+
+// -----------------------------------------------------------------------
+// Task 3: the collision gate itself
+// -----------------------------------------------------------------------
+
+#[tokio::test]
+async fn collision_declined_returns_to_intent_with_the_creator_never_called() {
+    let mut app = App::new(10);
+    app.open_wizard();
+    fill_through_parameters(&mut app, "brew-coffee", "brew coffee");
+
+    let mut terminal = fresh_terminal(80, 24);
+    let render_count = AtomicUsize::new(0);
+    let creator = MockWorkflowCreator::new();
+    let checker = QueueChecker::new(vec![colliding_report("countdown", "count down from a number", 0.81)]);
+
+    wizard_dispatch::handle_wizard_advance(&mut app, &creator, &checker, &mut terminal, 47100, &render_count).await;
+    assert_eq!(app.wizard().unwrap().step(), Step::CollisionCheck, "setup: expected the real collision to be pending");
+
+    // Blank answer at the save-anyway prompt declines by default (D-04).
+    wizard_dispatch::handle_wizard_advance(&mut app, &creator, &checker, &mut terminal, 47100, &render_count).await;
+
+    assert_eq!(app.wizard().unwrap().step(), Step::Intent, "declining must return to the intent step");
+    assert_eq!(creator.calls(), 0, "the creator mock's call counter must stay at 0 (T-10-20)");
+}
+
+#[tokio::test]
+async fn collision_overridden_reaches_review_and_a_confirmed_create_calls_the_mock_once_with_the_original_intent() {
+    let mut app = App::new(10);
+    app.open_wizard();
+    fill_through_parameters(&mut app, "brew-coffee", "brew coffee");
+
+    let mut terminal = fresh_terminal(80, 24);
+    let render_count = AtomicUsize::new(0);
+    let creator = MockWorkflowCreator::new();
+    let checker = QueueChecker::new(vec![colliding_report("countdown", "count down from a number", 0.81)]);
+
+    wizard_dispatch::handle_wizard_advance(&mut app, &creator, &checker, &mut terminal, 47100, &render_count).await;
+    assert_eq!(app.wizard().unwrap().step(), Step::CollisionCheck);
+
+    app.wizard_mut().unwrap().push_char('y');
+    wizard_dispatch::handle_wizard_advance(&mut app, &creator, &checker, &mut terminal, 47100, &render_count).await;
+    assert_eq!(app.wizard().unwrap().step(), Step::Review, "confirming the override must reach review");
+    assert_eq!(creator.calls(), 0, "reaching review must not itself create anything");
+
+    wizard_dispatch::handle_wizard_advance(&mut app, &creator, &checker, &mut terminal, 47100, &render_count).await;
+
+    assert_eq!(creator.calls(), 1, "a confirmed create must call the mock exactly once");
+    assert_eq!(
+        creator.last_request().intent,
+        Some("brew coffee".to_string()),
+        "the original intent must be preserved through an override, not the colliding one"
+    );
+}
+
+#[tokio::test]
+async fn a_degraded_check_proceeds_to_review_with_no_prompt_and_a_confirmed_create_still_calls_the_mock_once() {
+    let mut app = App::new(10);
+    app.open_wizard();
+    fill_through_parameters(&mut app, "brew-coffee", "brew coffee");
+
+    let mut terminal = fresh_terminal(80, 24);
+    let render_count = AtomicUsize::new(0);
+    let creator = MockWorkflowCreator::new();
+    let checker = QueueChecker::new(vec![degraded_report("ollama unreachable")]);
+
+    wizard_dispatch::handle_wizard_advance(&mut app, &creator, &checker, &mut terminal, 47100, &render_count).await;
+
+    assert_eq!(app.wizard().unwrap().step(), Step::Review, "a degraded check must proceed to review with no keypress");
+    assert_eq!(creator.calls(), 0);
+
+    wizard_dispatch::handle_wizard_advance(&mut app, &creator, &checker, &mut terminal, 47100, &render_count).await;
+
+    assert_eq!(creator.calls(), 1, "a confirmed create must still succeed after a degraded check");
+}
+
+// -----------------------------------------------------------------------
+// Task 3: terminal states
+// -----------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_successful_create_renders_the_success_line_with_the_workflow_id_and_path() {
+    let mut app = App::new(10);
+    app.open_wizard();
+    fill_through_parameters(&mut app, "brew-coffee", "brew coffee");
+
+    let mut terminal = fresh_terminal(100, 24);
+    let render_count = AtomicUsize::new(0);
+    let creator = MockWorkflowCreator::new();
+    let checker = QueueChecker::new(vec![no_collision_report()]);
+
+    wizard_dispatch::handle_wizard_advance(&mut app, &creator, &checker, &mut terminal, 47100, &render_count).await;
+    assert_eq!(app.wizard().unwrap().step(), Step::Review);
+    wizard_dispatch::handle_wizard_advance(&mut app, &creator, &checker, &mut terminal, 47100, &render_count).await;
+
+    assert_eq!(app.wizard().unwrap().success_path(), Some("/workflows/brew-coffee.md"));
+
+    let rendered = render_to_string(&mut app, 100, 24);
+    assert!(
+        rendered.contains("[OK] Workflow 'brew-coffee' created at /workflows/brew-coffee.md."),
+        "expected the documented success line: {rendered}"
+    );
+    assert!(
+        rendered.contains("Try it now: orchestrator run brew-coffee"),
+        "expected the try-it-now line demonstrating CREATEUI-02's same-session guarantee: {rendered}"
+    );
+}
+
+#[tokio::test]
+async fn server_rejection_renders_the_error_and_returns_to_the_id_step_only() {
+    let mut app = App::new(10);
+    app.open_wizard();
+    fill_through_parameters(&mut app, "brew-coffee", "brew coffee");
+
+    let mut terminal = fresh_terminal(100, 24);
+    let render_count = AtomicUsize::new(0);
+    let creator = MockWorkflowCreator::with_response(CreateWorkflowResponse {
+        created: false,
+        workflow_path: None,
+        script_path: None,
+        error: Some("workflow 'brew-coffee' already exists".to_string()),
+    });
+    let checker = QueueChecker::new(vec![no_collision_report()]);
+
+    wizard_dispatch::handle_wizard_advance(&mut app, &creator, &checker, &mut terminal, 47100, &render_count).await;
+    assert_eq!(app.wizard().unwrap().step(), Step::Review);
+    wizard_dispatch::handle_wizard_advance(&mut app, &creator, &checker, &mut terminal, 47100, &render_count).await;
+
+    assert_eq!(app.wizard().unwrap().step(), Step::Id, "a server rejection must re-prompt the id step only");
+    assert_eq!(
+        app.wizard().unwrap().server_error(),
+        Some("workflow 'brew-coffee' already exists")
+    );
+
+    let rendered = render_to_string(&mut app, 100, 24);
+    assert!(
+        rendered.contains("[ERROR] workflow 'brew-coffee' already exists"),
+        "expected the daemon's error text verbatim: {rendered}"
+    );
+}
+
+// -----------------------------------------------------------------------
+// Task 3, CREATEUI-02: same-session routing from the TUI
+// -----------------------------------------------------------------------
+
+struct StubOllama {
+    vectors: HashMap<String, Vec<f32>>,
+}
+
+impl StubOllama {
+    fn new(vectors: HashMap<String, Vec<f32>>) -> Self {
+        Self { vectors }
+    }
+}
+
+#[async_trait]
+impl OllamaApi for StubOllama {
+    async fn embed(&self, _model: &str, inputs: &[String]) -> Result<Vec<Vec<f32>>, RouterError> {
+        Ok(inputs.iter().map(|i| self.vectors.get(i).cloned().unwrap_or_default()).collect())
+    }
+
+    async fn generate_json(
+        &self,
+        _model: &str,
+        _system: &str,
+        _prompt: &str,
+        _schema: &serde_json::Value,
+    ) -> Result<serde_json::Value, RouterError> {
+        Ok(serde_json::json!({}))
+    }
+}
+
+async fn spawn_daemon(workflows_dir: &Path, vectors: HashMap<String, Vec<f32>>) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("failed to bind an ephemeral loopback port");
+    let port = listener
+        .local_addr()
+        .expect("failed to read the bound local_addr")
+        .port();
+    let handlers: HashMap<String, Box<dyn Service>> = HashMap::new();
+    let client: Arc<dyn OllamaApi> = Arc::new(StubOllama::new(vectors));
+    let router = Arc::new(Router::new(client, "nomic-embed-text", "llama3.2:3b"));
+    let orchestrator = Arc::new(InProcessOrchestrator::with_router(workflows_dir, handlers, router));
+    let activity_registry = Arc::new(orchestrator::activity::ActivityRegistry::new());
+    tokio::spawn(orchestrator::server::serve(listener, orchestrator, activity_registry));
+    port
+}
+
+/// The load-bearing test (CREATEUI-02): against an in-process daemon spawned
+/// with a stub `OllamaApi`, driving the wizard to completion through the
+/// SAME dispatch `run_loop` uses writes the `.md`, and then -- WITHOUT
+/// restarting or re-spawning that daemon -- a `ProtocolFrame::RouteUtterance`
+/// carrying the answered intent returns a `RouteResult` naming the new
+/// workflow. Mirrors `orchestrator-cli/tests/create_wizard_integration.rs`'s
+/// `created_workflow_is_routable_against_the_same_daemon_with_no_restart`.
+#[tokio::test]
+async fn a_tui_created_workflow_routes_against_the_same_daemon_with_no_restart() {
+    const INTENT: &str = "brew a fresh pot of coffee";
+    let mut vectors = HashMap::new();
+    vectors.insert(INTENT.to_string(), vec![1.0, 0.0, 0.0]);
+
+    let dir = TempDir::new().expect("failed to create tempdir");
+    let port = spawn_daemon(dir.path(), vectors).await;
+    let client = TuiWsClient::connect(&format!("ws://127.0.0.1:{port}"))
+        .await
+        .expect("connect should succeed against a live in-process WS server");
+
+    let mut app = App::new(10);
+    app.open_wizard();
+    fill_through_parameters(&mut app, "brew-coffee", INTENT);
+
+    let mut terminal = fresh_terminal(100, 24);
+    let render_count = AtomicUsize::new(0);
+
+    // Real collision check against the real daemon (zero prior workflows --
+    // nothing to collide with) -- proceeds straight to Review.
+    wizard_dispatch::handle_wizard_advance(&mut app, &client, &client, &mut terminal, port, &render_count).await;
+    assert_eq!(
+        app.wizard().unwrap().step(),
+        Step::Review,
+        "setup: expected a clean collision check against zero prior workflows to reach review"
+    );
+
+    // The real write.
+    wizard_dispatch::handle_wizard_advance(&mut app, &client, &client, &mut terminal, port, &render_count).await;
+    assert!(
+        app.wizard().unwrap().success_path().is_some(),
+        "expected the real daemon to confirm the create"
+    );
+
+    // No second spawn, no restart -- routing goes through the SAME client /
+    // daemon instance this wizard just wrote to.
+    let route_reply = timeout(
+        Duration::from_secs(2),
+        client.call_protocol(ProtocolFrame::RouteUtterance {
+            utterance: INTENT.to_string(),
+        }),
+    )
+    .await
+    .expect("call_protocol timed out")
+    .expect("call_protocol should not error against a live in-process WS server");
+
+    match route_reply {
+        ProtocolFrame::RouteResult { matched_workflow_id, .. } => {
+            assert_eq!(
+                matched_workflow_id,
+                Some("brew-coffee".to_string()),
+                "expected the newly-created workflow to be routable with no daemon restart"
+            );
+        }
+        other => panic!("expected ProtocolFrame::RouteResult, got: {other:?}"),
+    }
 }
