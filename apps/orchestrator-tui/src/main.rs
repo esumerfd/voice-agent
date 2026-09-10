@@ -28,6 +28,7 @@ mod app;
 mod cli;
 mod event;
 mod ui;
+mod wizard;
 mod ws_client;
 
 use std::time::Duration;

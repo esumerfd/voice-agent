@@ -8,6 +8,8 @@
 use ratatui::widgets::ListState;
 use shared::{ActivityEvent, ActivityLogEvent, ActivityStatus};
 
+use crate::wizard;
+
 /// Client-side view-model derived from a wire `ActivityEvent` -- the shape
 /// `ui.rs` renders one list row (and, if open, one detail tab) from.
 #[derive(Debug, Clone)]
@@ -38,10 +40,25 @@ impl From<ActivityEvent> for Activity {
 /// depending on this, so the same physical keys mean "move the list
 /// selection" while `Activities` is focused and "scroll the detail panel"
 /// while `Detail` is focused. A fresh `App` starts focused on `Activities`.
+///
+/// `Wizard` (Phase 10, plan 10-03, D-01) is a THIRD variant added
+/// ALONGSIDE the other two, never a replacement -- every prior TUI
+/// capability is read-only and stays that way; the wizard is the first
+/// write/input surface, reachable from `Activities` via `n` and returning
+/// to it on cancel or completion (10-04). Adding this variant deliberately
+/// breaks every exhaustive `Focus` match (`map_key` in `event.rs`) so the
+/// compiler forces a new arm at every site that needs one -- the same
+/// safety property `key_hints_are_all_really_mapped` already leans on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
     Activities,
     Detail,
+    // Not yet constructed by `main.rs`'s `run_loop` -- `open_wizard` (below)
+    // is the only production call site, and its own dispatch from
+    // `Action::OpenWizard` lands in 10-04 (see this plan's scope note on
+    // `open_wizard`). Exercised directly by this file's own tests.
+    #[allow(dead_code)]
+    Wizard,
 }
 
 /// The TUI's bounded client-side state (D-11): a `Vec<Activity>` capped at
@@ -71,6 +88,19 @@ pub struct App {
     detail_scroll: u16,
     detail_content_rows: usize,
     detail_viewport_rows: u16,
+    /// The wizard's own state machine while `focus == Focus::Wizard`
+    /// (Phase 10, plan 10-03) -- `None` whenever the wizard is closed. The
+    /// ONE field this plan adds to `App`; `WizardState` itself lives in
+    /// `wizard.rs`, mirroring how `Activity` (the domain model) and `App`
+    /// (the view-model/focus-owner) are already split.
+    ///
+    /// Read only by `open_wizard`/`close_wizard`/`wizard`/`wizard_mut`
+    /// below (this plan) and, from 10-04, by `main.rs`'s `run_loop`
+    /// dispatch and `ui.rs`'s real wizard render -- not yet by `fn main`
+    /// itself, so `cargo clippy`'s default target sees it as unread until
+    /// then.
+    #[allow(dead_code)]
+    wizard: Option<wizard::WizardState>,
 }
 
 impl App {
@@ -87,6 +117,7 @@ impl App {
             detail_scroll: 0,
             detail_content_rows: 0,
             detail_viewport_rows: 0,
+            wizard: None,
         }
     }
 
@@ -121,6 +152,48 @@ impl App {
     /// Moves keyboard focus to the Detail panel.
     pub fn focus_detail(&mut self) {
         self.focus = Focus::Detail;
+    }
+
+    /// Opens the wizard (Phase 10, plan 10-03, D-01): installs a fresh
+    /// `WizardState` and moves focus to `Focus::Wizard`. Reachable from
+    /// `Focus::Activities` via `n` (`event.rs`'s `OpenWizard` action,
+    /// Task 3) -- never touches the Activities selection or any open
+    /// detail tab, so both are exactly as they were once the wizard closes.
+    ///
+    /// Not yet called from `main.rs`'s `run_loop` -- dispatching
+    /// `Action::OpenWizard` into this (and the sibling methods below) is
+    /// 10-04's scope, per this plan's explicit boundary. `cargo clippy`'s
+    /// default (non-test) target therefore sees these four methods as
+    /// unreachable from `fn main` until then, even though this file's own
+    /// tests exercise every one of them directly.
+    #[allow(dead_code)]
+    pub fn open_wizard(&mut self) {
+        self.wizard = Some(wizard::WizardState::new());
+        self.focus = Focus::Wizard;
+    }
+
+    /// Closes the wizard and returns focus to `Focus::Activities`,
+    /// discarding the in-progress `WizardState`. The Activities selection
+    /// is untouched by either `open_wizard` or `close_wizard`, so it is
+    /// exactly what it was before the wizard opened.
+    #[allow(dead_code)]
+    pub fn close_wizard(&mut self) {
+        self.wizard = None;
+        self.focus = Focus::Activities;
+    }
+
+    /// The wizard's own state machine, if the wizard is currently open.
+    #[allow(dead_code)]
+    pub fn wizard(&self) -> Option<&wizard::WizardState> {
+        self.wizard.as_ref()
+    }
+
+    /// Mutable access to the wizard's state machine, if open -- the seam
+    /// `event.rs`'s `Action::Wizard*` handlers (Task 3, `main.rs`'s
+    /// `run_loop`, 10-04) drive every keystroke through.
+    #[allow(dead_code)]
+    pub fn wizard_mut(&mut self) -> Option<&mut wizard::WizardState> {
+        self.wizard.as_mut()
     }
 
     pub fn activities(&self) -> &[Activity] {

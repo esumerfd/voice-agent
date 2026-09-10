@@ -264,6 +264,14 @@ fn map_key(code: KeyCode, modifiers: KeyModifiers, focus: Focus, help_open: bool
             (KeyCode::BackTab, false) => Some(Action::PrevTab),
             _ => None,
         },
+        // Phase 10 plan 10-03 Task 2: `Focus::Wizard` added as a THIRD
+        // `Focus` variant (app.rs) to force this exhaustive match to grow a
+        // new arm -- the compiler pressure is deliberate (PATTERNS' stated
+        // safety property). This placeholder is inert; Task 3 (same plan)
+        // replaces it with the real text-entry-versus-global-command gate
+        // (T-10-12): `q`/`?` must type into the active field here, never
+        // reach the focus-independent `Quit`/`ShowHelp` block above.
+        Focus::Wizard => None,
     }
 }
 
