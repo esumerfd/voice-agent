@@ -157,9 +157,16 @@ fn footer_text(focus: Focus, width: u16) -> String {
 /// `Activities`/`Detail` show only under their matching focus.
 fn hint_visible_for(scope: HintScope, focus: Focus) -> bool {
     match scope {
-        HintScope::Global => true,
+        // Phase 10, plan 10-03, Task 3: `Focus::Wizard` shows ONLY
+        // `Wizard`-scoped hints, deliberately excluding `Global` --
+        // `q quit`/`? help` would otherwise stay advertised while those
+        // keys type characters instead of running their command under this
+        // focus (see `event.rs`'s `n` `KeyHint` doc comment for the full
+        // rationale, including the footer-column-budget hazard).
+        HintScope::Global => focus != Focus::Wizard,
         HintScope::Activities => focus == Focus::Activities,
         HintScope::Detail => focus == Focus::Detail,
+        HintScope::Wizard => focus == Focus::Wizard,
     }
 }
 
@@ -1267,6 +1274,50 @@ mod tests {
             text.contains("j/k move   "),
             "the Activities footer, which already fits, must keep its three-space separator rather than always narrowing: {text:?}"
         );
+    }
+
+    // -- Phase 10, plan 10-03, Task 3: the wizard's footer scope ----------
+
+    #[test]
+    fn detail_footer_is_byte_identical_to_its_value_before_this_plan() {
+        // Snapshot taken before this plan's changes -- this plan adds only
+        // an `Activities`-scoped `n` hint and two `Wizard`-scoped hints,
+        // neither of which `hint_visible_for` shows under `Focus::Detail`,
+        // so this exact string must be unaffected. Proves no existing
+        // footer row was silently clipped or otherwise changed by the new
+        // hints (the measured 79-of-80-column headroom this module's own
+        // doc comment records).
+        assert_eq!(
+            footer_text(Focus::Detail, 80),
+            "j/k scroll d/u half ^d/^u pg g/G start/end Tab/S-Tab tab Esc back ? help q quit"
+        );
+    }
+
+    #[test]
+    fn wizard_footer_shows_its_own_hints_and_hides_global_quit_and_help() {
+        let text = footer_text(Focus::Wizard, 80);
+        assert!(text.contains("Enter advance"), "the wizard footer must show its advance hint: {text:?}");
+        assert!(text.contains("Esc cancel"), "the wizard footer must show its cancel hint: {text:?}");
+        assert!(
+            !text.contains("q quit"),
+            "the wizard footer must not advertise q as quit -- it types instead: {text:?}"
+        );
+        assert!(
+            !text.contains("? help"),
+            "the wizard footer must not advertise ? as help -- it types instead: {text:?}"
+        );
+    }
+
+    #[test]
+    fn activities_and_wizard_footers_fit_within_eighty_columns() {
+        for focus in [Focus::Activities, Focus::Wizard] {
+            let text = footer_text(focus, 80);
+            assert!(
+                text.chars().count() <= 80,
+                "footer text for {focus:?} must fit within 80 columns: {text:?} ({} cols)",
+                text.chars().count()
+            );
+        }
     }
 
     #[test]

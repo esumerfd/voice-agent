@@ -127,6 +127,19 @@ async fn run_loop(
             Some(Action::Quit) => break,
             Some(Action::ShowHelp) => app.show_help(),
             Some(Action::CloseHelp) => app.close_help(),
+            // Phase 10, plan 10-03: `event.rs`'s `map_key` produces these
+            // under `Focus::Wizard` (Task 3), but dispatching them into
+            // `App`'s wizard state and rendering the wizard screen are
+            // 10-04's scope, per this plan's explicit boundary -- inert
+            // here for now.
+            Some(
+                Action::OpenWizard
+                | Action::WizardChar(_)
+                | Action::WizardBackspace
+                | Action::WizardAdvance
+                | Action::WizardBack
+                | Action::WizardCancel,
+            ) => {}
             None => {}
         }
     }

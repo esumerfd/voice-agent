@@ -37,6 +37,25 @@ pub enum Action {
     ScrollBottom,
     NextTab,
     PrevTab,
+    /// Opens the wizard from `Focus::Activities` (Phase 10, plan 10-03,
+    /// D-01) -- `App::open_wizard`.
+    OpenWizard,
+    /// A printable character typed into the wizard's active field buffer
+    /// (T-10-12): this is what `q`/`?` map to under `Focus::Wizard`,
+    /// INSTEAD of `Quit`/`ShowHelp` -- see `map_key`'s focus-independent
+    /// gate below.
+    WizardChar(char),
+    /// Removes the last character from the wizard's active field buffer.
+    WizardBackspace,
+    /// Validates the active field and advances to the next wizard step (or
+    /// commits the current repeatable-list/menu entry).
+    WizardAdvance,
+    /// Returns to the previous wizard step (10-04 binds this to a key; not
+    /// yet reachable via `map_key` in this plan).
+    #[allow(dead_code)]
+    WizardBack,
+    /// Cancels and closes the wizard, returning to `Focus::Activities`.
+    WizardCancel,
 }
 
 /// Which panel a `KeyHint` applies to (Task 1 D-1): the footer filters on
@@ -48,6 +67,12 @@ pub enum HintScope {
     Global,
     Activities,
     Detail,
+    /// Phase 10, plan 10-03: hints visible only while `Focus::Wizard` has
+    /// keyboard focus. `hint_visible_for` (`ui.rs`) shows `Wizard`-scoped
+    /// hints and hides `Global`-scoped ones under this focus -- a
+    /// deliberate departure from treating the wizard's entry hint as
+    /// `Global`, see `n`'s `KeyHint` doc comment below for both reasons.
+    Wizard,
 }
 
 /// One advertised keybinding: the raw `KeyCode` it maps from, its terse
@@ -185,6 +210,51 @@ pub const KEY_HINTS: &[KeyHint] = &[
         scope: HintScope::Global,
         ctrl: false,
     },
+    // Phase 10, plan 10-03 (D-01): the wizard's entry point and its own
+    // footer hints.
+    //
+    // `n` is scoped to `Activities`, NOT `Global`, even though UI-SPEC's
+    // own draft suggested a `Global`-scope entry hint. Two independently
+    // sufficient reasons, both required reading before changing this back:
+    //   1. `Global` means "always visible" -- `q quit` and `? help` would
+    //      stay advertised under `Focus::Wizard` even though those keys
+    //      type characters there instead of running their command (see the
+    //      focus-independent gate in `map_key` below). This codebase
+    //      treats an advertised key that does not match its binding as a
+    //      policy violation (the `key_hints_are_all_really_mapped` guard
+    //      exists precisely to catch that), not a style nit.
+    //   2. `footer_text`'s own doc comment (`ui.rs`) records the
+    //      Detail-focus footer sitting at 79 of 80 columns -- one column of
+    //      headroom. A `Global`-scoped `n new` hint adds six characters to
+    //      EVERY footer row, including Detail's, and would silently clip
+    //      `q quit` off the right edge (a `Paragraph` on a one-row
+    //      `Constraint::Length(1)` clips without wrapping or erroring).
+    // Scoping to `Activities` instead leaves the Detail row untouched and
+    // keeps the Activities row well inside budget.
+    KeyHint {
+        code: KeyCode::Char('n'),
+        keys: "n",
+        short: "new",
+        long: "start the guided workflow-creation wizard",
+        scope: HintScope::Activities,
+        ctrl: false,
+    },
+    KeyHint {
+        code: KeyCode::Enter,
+        keys: "Enter",
+        short: "advance",
+        long: "validate the current field and advance (creates the workflow on the final step)",
+        scope: HintScope::Wizard,
+        ctrl: false,
+    },
+    KeyHint {
+        code: KeyCode::Esc,
+        keys: "Esc",
+        short: "cancel",
+        long: "cancel and close the wizard",
+        scope: HintScope::Wizard,
+        ctrl: false,
+    },
 ];
 
 /// Maps a raw crossterm `KeyCode` to an `Action`, modal on `help_open` (D-2)
@@ -209,8 +279,9 @@ pub const KEY_HINTS: &[KeyHint] = &[
 /// Once past the help gate: `q` and `?` are focus-independent (`Quit`,
 /// `ShowHelp`). Under `Focus::Activities`: `j`/`k` -> `SelectNext`/
 /// `SelectPrev`, `Enter` -> `OpenTab`, `g`/`G` -> `SelectFirst`/
-/// `SelectLast`. Under `Focus::Detail` (Task 2): `Esc` -> `FocusActivities`,
-/// `j`/`k` -> `ScrollDown`/`ScrollUp`, `d`/`u` -> `ScrollHalfPageDown`/
+/// `SelectLast`, `n` -> `OpenWizard` (Phase 10, plan 10-03, D-01). Under
+/// `Focus::Detail` (Task 2): `Esc` -> `FocusActivities`, `j`/`k` ->
+/// `ScrollDown`/`ScrollUp`, `d`/`u` -> `ScrollHalfPageDown`/
 /// `ScrollHalfPageUp`, `Ctrl-d`/`Ctrl-u` -> `ScrollPageDown`/`ScrollPageUp`,
 /// `g`/`G` -> `ScrollTop`/`ScrollBottom` -- the SAME physical keys as
 /// Activities' `j`/`k`/`g`/`G`, routed to a different meaning purely by
@@ -224,6 +295,15 @@ pub const KEY_HINTS: &[KeyHint] = &[
 /// is irrelevant here since `modifiers` is already reduced to the `ctrl`
 /// bit above, so `BackTab` matches on its own code alone regardless of
 /// whether SHIFT was reported.
+///
+/// Under `Focus::Wizard` (Phase 10, plan 10-03, Task 3, T-10-12): `Enter`
+/// -> `WizardAdvance`, `Backspace` -> `WizardBackspace`, `Esc` ->
+/// `WizardCancel`; every other printable character -> `WizardChar(c)`,
+/// INCLUDING `q` and `?`. This is why the focus-independent `q`/`?` block
+/// below is gated off under this focus -- without that gate, typing the
+/// letter `q` into a workflow id would quit the whole application and
+/// discard the in-progress form (T-10-12, the single most important line
+/// in this function).
 fn map_key(code: KeyCode, modifiers: KeyModifiers, focus: Focus, help_open: bool) -> Option<Action> {
     if help_open {
         return match code {
@@ -234,11 +314,18 @@ fn map_key(code: KeyCode, modifiers: KeyModifiers, focus: Focus, help_open: bool
 
     let ctrl = modifiers.contains(KeyModifiers::CONTROL);
 
-    // Focus-independent bindings.
-    match code {
-        KeyCode::Char('q') => return Some(Action::Quit),
-        KeyCode::Char('?') => return Some(Action::ShowHelp),
-        _ => {}
+    // Focus-independent bindings -- EXCEPT under `Focus::Wizard` (T-10-12):
+    // while a wizard field is being typed into, `q` and `?` must enter the
+    // buffer like any other character, never quit or open the help
+    // overlay. Gating this block is the load-bearing fix; the modal help
+    // gate above stays unconditional and ahead of everything, since no
+    // focus can reach text entry while the overlay is open.
+    if focus != Focus::Wizard {
+        match code {
+            KeyCode::Char('q') => return Some(Action::Quit),
+            KeyCode::Char('?') => return Some(Action::ShowHelp),
+            _ => {}
+        }
     }
 
     match focus {
@@ -248,6 +335,7 @@ fn map_key(code: KeyCode, modifiers: KeyModifiers, focus: Focus, help_open: bool
             (KeyCode::Enter, false) => Some(Action::OpenTab),
             (KeyCode::Char('g'), false) => Some(Action::SelectFirst),
             (KeyCode::Char('G'), _) => Some(Action::SelectLast),
+            (KeyCode::Char('n'), false) => Some(Action::OpenWizard),
             _ => None,
         },
         Focus::Detail => match (code, ctrl) {
@@ -264,14 +352,17 @@ fn map_key(code: KeyCode, modifiers: KeyModifiers, focus: Focus, help_open: bool
             (KeyCode::BackTab, false) => Some(Action::PrevTab),
             _ => None,
         },
-        // Phase 10 plan 10-03 Task 2: `Focus::Wizard` added as a THIRD
-        // `Focus` variant (app.rs) to force this exhaustive match to grow a
-        // new arm -- the compiler pressure is deliberate (PATTERNS' stated
-        // safety property). This placeholder is inert; Task 3 (same plan)
-        // replaces it with the real text-entry-versus-global-command gate
-        // (T-10-12): `q`/`?` must type into the active field here, never
-        // reach the focus-independent `Quit`/`ShowHelp` block above.
-        Focus::Wizard => None,
+        // T-10-12: Enter/Backspace/Esc are commands; every other printable
+        // character -- INCLUDING `q` and `?`, gated off above -- enters the
+        // active field's buffer verbatim. `main.rs`'s `run_loop` dispatch
+        // for these actions is 10-04's scope.
+        Focus::Wizard => match code {
+            KeyCode::Enter => Some(Action::WizardAdvance),
+            KeyCode::Backspace => Some(Action::WizardBackspace),
+            KeyCode::Esc => Some(Action::WizardCancel),
+            KeyCode::Char(c) => Some(Action::WizardChar(c)),
+            _ => None,
+        },
     }
 }
 
@@ -543,15 +634,110 @@ mod tests {
         for hint in KEY_HINTS {
             let focus = match hint.scope {
                 HintScope::Detail => Focus::Detail,
+                HintScope::Wizard => Focus::Wizard,
                 HintScope::Activities | HintScope::Global => Focus::Activities,
             };
             let modifiers = if hint.ctrl { KeyModifiers::CONTROL } else { KeyModifiers::NONE };
+            let action = map_key(hint.code, modifiers, focus, false);
             assert!(
-                map_key(hint.code, modifiers, focus, false).is_some(),
+                action.is_some(),
                 "advertised key hint {:?} (scope {:?}) has no live binding in map_key",
                 hint.code,
                 hint.scope
             );
+
+            // Strengthened guard (Phase 10, plan 10-03, Task 3): under
+            // `Focus::Wizard`, EVERY character maps to `WizardChar` --
+            // `action.is_some()` alone would pass trivially for any
+            // `Wizard`-scoped hint regardless of whether it names a real
+            // command or is secretly just typing a letter. A wizard-scoped
+            // hint must resolve to a COMMAND action.
+            if hint.scope == HintScope::Wizard {
+                assert!(
+                    !matches!(action, Some(Action::WizardChar(_))),
+                    "wizard-scoped hint {:?} must resolve to a command action, not text entry",
+                    hint.code
+                );
+            }
         }
+    }
+
+    // -- Phase 10, plan 10-03, Task 3: Focus::Wizard text entry (T-10-12) --
+
+    #[test]
+    fn n_opens_the_wizard_from_activities_only() {
+        assert_eq!(
+            map_key(KeyCode::Char('n'), NONE, Focus::Activities, false),
+            Some(Action::OpenWizard)
+        );
+        assert_eq!(map_key(KeyCode::Char('n'), NONE, Focus::Detail, false), None);
+    }
+
+    #[test]
+    fn ordinary_characters_enter_the_wizard_field_buffer() {
+        assert_eq!(
+            map_key(KeyCode::Char('a'), NONE, Focus::Wizard, false),
+            Some(Action::WizardChar('a'))
+        );
+    }
+
+    #[test]
+    fn q_and_question_mark_type_into_the_wizard_instead_of_quitting_or_helping() {
+        assert_eq!(
+            map_key(KeyCode::Char('q'), NONE, Focus::Wizard, false),
+            Some(Action::WizardChar('q'))
+        );
+        assert_ne!(
+            map_key(KeyCode::Char('q'), NONE, Focus::Wizard, false),
+            Some(Action::Quit),
+            "q must never quit while a wizard field has focus (T-10-12)"
+        );
+        assert_eq!(
+            map_key(KeyCode::Char('?'), NONE, Focus::Wizard, false),
+            Some(Action::WizardChar('?'))
+        );
+        assert_ne!(
+            map_key(KeyCode::Char('?'), NONE, Focus::Wizard, false),
+            Some(Action::ShowHelp),
+            "? must never open help while a wizard field has focus (T-10-12)"
+        );
+    }
+
+    #[test]
+    fn q_and_question_mark_still_command_outside_the_wizard() {
+        for focus in [Focus::Activities, Focus::Detail] {
+            assert_eq!(map_key(KeyCode::Char('q'), NONE, focus, false), Some(Action::Quit));
+            assert_eq!(map_key(KeyCode::Char('?'), NONE, focus, false), Some(Action::ShowHelp));
+        }
+    }
+
+    #[test]
+    fn wizard_commands_map_enter_backspace_and_esc() {
+        assert_eq!(map_key(KeyCode::Enter, NONE, Focus::Wizard, false), Some(Action::WizardAdvance));
+        assert_eq!(
+            map_key(KeyCode::Backspace, NONE, Focus::Wizard, false),
+            Some(Action::WizardBackspace)
+        );
+        assert_eq!(map_key(KeyCode::Esc, NONE, Focus::Wizard, false), Some(Action::WizardCancel));
+    }
+
+    #[test]
+    fn modal_help_still_wins_over_the_wizard_focus() {
+        assert_eq!(map_key(KeyCode::Char('q'), NONE, Focus::Wizard, true), Some(Action::CloseHelp));
+        assert_eq!(map_key(KeyCode::Char('?'), NONE, Focus::Wizard, true), Some(Action::CloseHelp));
+        assert_eq!(map_key(KeyCode::Esc, NONE, Focus::Wizard, true), Some(Action::CloseHelp));
+        assert_eq!(map_key(KeyCode::Char('a'), NONE, Focus::Wizard, true), None);
+    }
+
+    #[test]
+    fn uppercase_and_multi_byte_characters_enter_the_wizard_buffer_intact() {
+        assert_eq!(
+            map_key(KeyCode::Char('G'), NONE, Focus::Wizard, false),
+            Some(Action::WizardChar('G'))
+        );
+        assert_eq!(
+            map_key(KeyCode::Char('é'), NONE, Focus::Wizard, false),
+            Some(Action::WizardChar('é'))
+        );
     }
 }
