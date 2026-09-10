@@ -18,6 +18,7 @@
 //! unchanged).
 
 pub mod cache;
+pub mod collision;
 pub mod confirm_tier;
 pub mod ollama_client;
 pub mod schema;
@@ -27,6 +28,7 @@ pub mod threshold;
 use std::sync::Arc;
 
 use cache::EmbeddingCache;
+use collision::IntentCollision;
 use confirm_tier::ConfirmTier;
 use ollama_client::{embed_with_retry, OllamaApi};
 use similarity::cosine_similarity;
@@ -447,6 +449,95 @@ impl Router {
                 detail: Some("no candidate workflow matched".to_string()),
             },
         })
+    }
+
+    /// Save-time semantic-collision check (Phase 10 plan 10-02, D-03/D-04):
+    /// resolves whether `intent` -- a NEW workflow's not-yet-saved intent
+    /// phrase -- collides with any EXISTING workflow's intent in `registry`.
+    /// Read-only classification, never a routing turn: this never calls
+    /// `extract_params`, `confirm_tier`, `dispatch`, or anything that mints a
+    /// run id.
+    ///
+    /// Reuses `route`'s exact bounded prologue: an empty (or whitespace-only)
+    /// intent, or one over `threshold::MAX_UTTERANCE_CHARS` Unicode code
+    /// points, is rejected as `Ok(None)` before any cache sync or client
+    /// call -- the embed-call counter is provably 0 for either case (T-10-07).
+    /// Candidates are gathered exactly like `route`'s own candidate
+    /// collection: every workflow in `registry.enumerate()` whose trimmed
+    /// `intent` is non-empty. The SAME embedding cache `route` uses is
+    /// synced first (D-06's reload-aware mechanism, no second cache), then
+    /// exactly one `embed_with_retry` call embeds the probe intent. A
+    /// `RouterError` from either the cache sync or the probe embed
+    /// PROPAGATES as `Err` -- never swallowed into `Ok(None)` -- so the
+    /// caller (`InProcessOrchestrator::check_intent_collision`) can
+    /// distinguish "no collision" from "could not check" and degrade the
+    /// latter into a non-blocking warning, per D-04.
+    pub async fn check_intent_collision(
+        &self,
+        intent: &str,
+        registry: &Registry,
+    ) -> Result<Option<IntentCollision>, RouterError> {
+        let trimmed = intent.trim();
+        if trimmed.is_empty() {
+            return Ok(None);
+        }
+        let char_count = trimmed.chars().count();
+        if char_count > threshold::MAX_UTTERANCE_CHARS {
+            return Ok(None);
+        }
+
+        let probe_intent = intent.to_string();
+
+        // Candidates: every workflow whose trimmed `intent` is non-empty, in
+        // `Registry::enumerate()`'s existing id-sorted order -- identical
+        // collection discipline to `route`'s own candidate gathering.
+        let candidates: Vec<(String, String)> = registry
+            .enumerate()
+            .into_iter()
+            .filter_map(|summary| {
+                registry.lookup(&summary.id).and_then(|def| {
+                    let candidate_intent = def.intent.trim();
+                    if candidate_intent.is_empty() {
+                        None
+                    } else {
+                        Some((summary.id, candidate_intent.to_string()))
+                    }
+                })
+            })
+            .collect();
+
+        {
+            let mut cache = self.cache.lock().await;
+            #[cfg(test)]
+            {
+                let stats = cache.sync(&candidates, self.client.as_ref(), &self.embed_model).await?;
+                *self.last_sync.lock().await = stats;
+            }
+            #[cfg(not(test))]
+            {
+                cache.sync(&candidates, self.client.as_ref(), &self.embed_model).await?;
+            }
+        }
+
+        let probe_embeddings =
+            embed_with_retry(self.client.as_ref(), &self.embed_model, std::slice::from_ref(&probe_intent)).await?;
+        let probe_embedding = probe_embeddings.into_iter().next().ok_or_else(|| {
+            RouterError::MalformedResponse {
+                endpoint: format!("{}: /api/embed", self.embed_model),
+                detail: "embed call for the probe intent returned zero vectors".to_string(),
+            }
+        })?;
+
+        let cache = self.cache.lock().await;
+        let triples: Vec<(String, String, Vec<f32>)> = candidates
+            .into_iter()
+            .filter_map(|(id, candidate_intent)| {
+                cache.lookup(&id).map(|embedding| (id, candidate_intent, embedding.to_vec()))
+            })
+            .collect();
+        drop(cache);
+
+        Ok(collision::find_collision(&probe_embedding, &triples, collision::COLLISION_THRESHOLD))
     }
 }
 
@@ -1091,5 +1182,113 @@ mod tests {
 
         assert_eq!(extracted, Some(serde_json::json!({"duration_minutes": 5})));
         assert_eq!(detail, None);
+    }
+
+    // -----------------------------------------------------------------
+    // Plan 10-02, Task 1: Router::check_intent_collision
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn a_probe_intent_identical_to_an_existing_intent_names_the_lower_id_candidate_when_it_is_also_higher_scoring() {
+        let mut vectors = two_workflow_vectors();
+        vectors.insert("a brand new calendar-like intent".to_string(), vec![1.0, 0.0, 0.0]);
+        let client = Arc::new(MockOllama::new(vectors));
+        let router = Router::new(client, "nomic-embed-text", "llama3.2:3b");
+        let registry = registry_from(&[
+            ("calendar_today", calendar_intent()),
+            ("set_timer", timer_intent()),
+        ]);
+
+        let result = router
+            .check_intent_collision("a brand new calendar-like intent", &registry)
+            .await
+            .expect("check_intent_collision should succeed");
+
+        let collision = result.expect("expected a collision against calendar_today");
+        assert_eq!(collision.workflow_id, "calendar_today");
+        assert_eq!(collision.intent, calendar_intent());
+    }
+
+    #[tokio::test]
+    async fn distinguishable_intents_report_no_collision() {
+        let mut vectors = two_workflow_vectors();
+        vectors.insert("something totally unrelated".to_string(), vec![0.0, 0.0, 1.0]);
+        let client = Arc::new(MockOllama::new(vectors));
+        let router = Router::new(client, "nomic-embed-text", "llama3.2:3b");
+        let registry = registry_from(&[
+            ("calendar_today", calendar_intent()),
+            ("set_timer", timer_intent()),
+        ]);
+
+        let result = router
+            .check_intent_collision("something totally unrelated", &registry)
+            .await
+            .expect("check_intent_collision should succeed");
+
+        assert_eq!(result, None);
+    }
+
+    #[tokio::test]
+    async fn check_intent_collision_issues_exactly_one_probe_embed_call_beyond_the_cache_sync() {
+        let mut vectors = two_workflow_vectors();
+        vectors.insert("probe intent text".to_string(), vec![0.0, 0.0, 1.0]);
+        let client = Arc::new(MockOllama::new(vectors));
+        let router = Router::new(client.clone(), "nomic-embed-text", "llama3.2:3b");
+        let registry = registry_from(&[
+            ("calendar_today", calendar_intent()),
+            ("set_timer", timer_intent()),
+        ]);
+
+        // First call embeds both candidates plus the probe -- 1 batched
+        // call for the corpus sync, 1 for the probe.
+        router.check_intent_collision("probe intent text", &registry).await.expect("first check");
+        let calls_after_first = client.call_count();
+
+        // Second call against the SAME unchanged registry should only issue
+        // ONE additional embed call (the probe) -- the corpus is already
+        // cached.
+        router.check_intent_collision("probe intent text", &registry).await.expect("second check");
+        let calls_after_second = client.call_count();
+
+        assert_eq!(
+            calls_after_second - calls_after_first,
+            1,
+            "expected exactly ONE additional embed call (the probe intent) beyond whatever the cache sync needs"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_or_whitespace_only_intent_returns_ok_none_with_zero_probe_calls() {
+        let client = Arc::new(MockOllama::new(two_workflow_vectors()));
+        let router = Router::new(client.clone(), "nomic-embed-text", "llama3.2:3b");
+        let registry =
+            registry_from(&[("calendar_today", calendar_intent()), ("set_timer", timer_intent())]);
+
+        let result = router
+            .check_intent_collision("   ", &registry)
+            .await
+            .expect("check_intent_collision should succeed (no collision, nothing to check)");
+
+        assert_eq!(result, None);
+        assert_eq!(client.call_count(), 0, "an empty/whitespace-only intent must never trigger an Ollama call");
+    }
+
+    #[tokio::test]
+    async fn a_router_error_from_the_probe_embed_propagates_as_err_not_ok_none() {
+        let client = Arc::new(MockOllama::with_behavior(HashMap::new(), MockBehavior::Unreachable));
+        let router = Router::new(client.clone(), "nomic-embed-text", "llama3.2:3b");
+        // No candidates -- isolates the assertion to the probe embed call.
+        let registry = registry_from(&[]);
+
+        let result = router.check_intent_collision("anything at all", &registry).await;
+
+        assert_eq!(
+            result,
+            Err(RouterError::OllamaUnreachable {
+                base_url: "mock://ollama".to_string(),
+                detail: "connection refused".to_string()
+            }),
+            "expected an Ollama failure to propagate as Err, never swallowed into Ok(None)"
+        );
     }
 }
