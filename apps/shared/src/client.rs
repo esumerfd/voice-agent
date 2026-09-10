@@ -205,11 +205,15 @@ pub struct CreateWorkflowResponse {
     pub error: Option<String>,
 }
 
-/// A second, narrow trait (D-DISC-02) kept separate from
-/// `OrchestratorClient` so `orchestrator-tui`'s `TuiWsClient` (which will
-/// never create workflows) is not forced to grow an unused method.
-/// Implemented by `InProcessOrchestrator` (daemon side) and
-/// `WsOrchestratorClient` (CLI side).
+/// A second, narrow trait (D-DISC-02), originally kept separate from
+/// `OrchestratorClient` so a read-only client would not be forced to grow
+/// an unused method. As of Phase 10 (plan 10-04), `orchestrator-tui`'s
+/// `TuiWsClient` DOES implement this -- the wizard is the TUI's first write
+/// capability, reached through this same seam the CLI already uses, never a
+/// bespoke wire call. The narrow-trait rationale itself still holds:
+/// `TuiWsClient` does not implement `WorkflowDeleter` (T-10-21, the TUI can
+/// create, never destroy). Implemented by `InProcessOrchestrator` (daemon
+/// side), `WsOrchestratorClient` (CLI side), and `TuiWsClient` (TUI side).
 #[async_trait]
 pub trait WorkflowCreator: Send + Sync {
     async fn create_workflow(&self, req: CreateWorkflowRequest) -> CreateWorkflowResponse;

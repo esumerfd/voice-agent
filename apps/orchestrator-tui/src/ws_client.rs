@@ -28,9 +28,10 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 use shared::{
-    ActivityEvent, DescribeWorkflowRequest, DescribeWorkflowResponse, Envelope, InvokeStatus,
+    ActivityEvent, CreateWorkflowRequest, CreateWorkflowResponse, DescribeWorkflowRequest,
+    DescribeWorkflowResponse, Envelope, IntentCollisionChecker, IntentCollisionReport, InvokeStatus,
     InvokeWorkflowRequest, InvokeWorkflowResponse, ListWorkflowsRequest, ListWorkflowsResponse,
-    OrchestratorClient, RequestPayload, ResponsePayload,
+    OrchestratorClient, ProtocolFrame, RequestPayload, ResponsePayload, WorkflowCreator,
 };
 
 /// This client's self-reported identity (D-04) -- must be the first frame
@@ -47,6 +48,13 @@ type WsWrite = SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, Message>;
 pub struct TuiWsClient {
     write: Arc<AsyncMutex<WsWrite>>,
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<ResponsePayload>>>>,
+    /// Pending `ProtocolFrame` calls (Phase 10, plan 10-04), mirroring
+    /// `orchestrator-cli/src/ws_client.rs`'s `pending_protocol` exactly --
+    /// SEPARATE from `pending` above even though both share `next_id`, so a
+    /// `Res` and a `Protocol` reply can never contend for the same slot
+    /// (the 09-03 frame-id correlation hazard: a server-pushed `Welcome` at
+    /// id 0 could otherwise resolve a pending call).
+    pending_protocol: Arc<Mutex<HashMap<u64, oneshot::Sender<ProtocolFrame>>>>,
     next_id: AtomicU64,
     /// Server-pushed `Activity` events (D-01/D-03), forwarded here by the
     /// read loop. Unlike the CLI's unconsumed `events` field, this is the
@@ -87,9 +95,12 @@ impl TuiWsClient {
 
         let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<ResponsePayload>>>> =
             Arc::new(Mutex::new(HashMap::new()));
+        let pending_protocol: Arc<Mutex<HashMap<u64, oneshot::Sender<ProtocolFrame>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
         let (activity_tx, activity_rx) = mpsc::unbounded_channel();
 
         let loop_pending = Arc::clone(&pending);
+        let loop_pending_protocol = Arc::clone(&pending_protocol);
         tokio::spawn(async move {
             while let Some(msg) = read.next().await {
                 let Ok(msg) = msg else {
@@ -130,12 +141,39 @@ impl TuiWsClient {
                     Envelope::Req { .. } | Envelope::Hello { .. } => {
                         // orchestratord never sends a Req/Hello to a client; ignore defensively.
                     }
-                    // Phase 8 (D-01/D-05): orchestrator-tui doesn't consume
-                    // the Phase 8 protocol frames yet -- it renders run
-                    // state exclusively from Activity frames, so a Welcome
-                    // or RunDescription is ignored rather than treated as
-                    // unexpected, mirroring the Req/Hello no-op arm above.
-                    Envelope::Protocol { .. } => {}
+                    // Phase 10, plan 10-04 (T-10-19, the 09-03 frame-id
+                    // correlation hazard): resolve a pending `call_protocol`
+                    // entry ONLY for reply-shaped variants. `Welcome` is
+                    // server-push-only and arrives with id 0 as the very
+                    // FIRST server-to-client frame on every connection,
+                    // before any request is ever made -- if it resolved a
+                    // pending entry by id alone, it would silently steal a
+                    // call issued as the connection's very first request.
+                    // `DescribeRun`/`RouteUtterance`/`CheckIntentCollision`
+                    // are client-to-daemon only and never arrive here.
+                    Envelope::Protocol { id, frame } => match frame {
+                        ProtocolFrame::RouteResult { .. }
+                        | ProtocolFrame::RunDescription { .. }
+                        | ProtocolFrame::IntentCollisionResult { .. } => {
+                            let sender = {
+                                let mut guard = loop_pending_protocol
+                                    .lock()
+                                    .expect("ws_client pending_protocol mutex poisoned");
+                                guard.remove(&id)
+                            };
+                            if let Some(sender) = sender {
+                                let _ = sender.send(frame); // caller may have given up already -- a handled no-op
+                            }
+                        }
+                        ProtocolFrame::Welcome { .. }
+                        | ProtocolFrame::DescribeRun { .. }
+                        | ProtocolFrame::RouteUtterance { .. }
+                        | ProtocolFrame::CheckIntentCollision { .. } => {
+                            // Server-push-only (Welcome) or client-to-daemon-only
+                            // (DescribeRun/RouteUtterance/CheckIntentCollision) --
+                            // never resolves a pending call. Ignored defensively.
+                        }
+                    },
                 }
             }
         });
@@ -143,6 +181,7 @@ impl TuiWsClient {
         Ok(Self {
             write,
             pending,
+            pending_protocol,
             next_id: AtomicU64::new(0),
             activity_rx: Arc::new(AsyncMutex::new(activity_rx)),
         })
@@ -213,6 +252,48 @@ impl TuiWsClient {
         rx.await
             .unwrap_or_else(|_| failure_payload("connection closed before a response arrived"))
     }
+
+    /// Sends `frame` as a fresh `Envelope::Protocol`, suspends on a
+    /// `oneshot`, and returns the correlated reply `ProtocolFrame` once the
+    /// read loop resolves it (Phase 10, plan 10-04). Mirrors `call`'s
+    /// structure exactly, and mirrors `orchestrator-cli/src/ws_client.rs`'s
+    /// `call_protocol`: allocates an id from the SAME `next_id` counter
+    /// `call` uses -- sharing it keeps ids globally unique on the
+    /// connection, so a `Res` and a `Protocol` reply can never contend for
+    /// the same slot. On any encode or send failure, removes the pending
+    /// entry and returns `Err` naming the failure -- never a panic.
+    pub async fn call_protocol(&self, frame: ProtocolFrame) -> Result<ProtocolFrame, String> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = oneshot::channel();
+        self.pending_protocol
+            .lock()
+            .expect("ws_client pending_protocol mutex poisoned")
+            .insert(id, tx);
+
+        let envelope = Envelope::Protocol { id, frame };
+        let Ok(text) = serde_json::to_string(&envelope) else {
+            self.pending_protocol
+                .lock()
+                .expect("ws_client pending_protocol mutex poisoned")
+                .remove(&id);
+            return Err("failed to encode protocol request envelope".to_string());
+        };
+
+        let send_result = {
+            let mut guard = self.write.lock().await;
+            guard.send(Message::text(text)).await
+        };
+        if send_result.is_err() {
+            self.pending_protocol
+                .lock()
+                .expect("ws_client pending_protocol mutex poisoned")
+                .remove(&id);
+            return Err("failed to send protocol request over the WS connection".to_string());
+        }
+
+        rx.await
+            .map_err(|_| "connection closed before a response arrived".to_string())
+    }
 }
 
 /// Synthesizes a failure-shaped `InvokeWorkflow` response for a transport
@@ -263,6 +344,71 @@ impl OrchestratorClient for TuiWsClient {
             _ => DescribeWorkflowResponse {
                 found: false,
                 parameters: Vec::new(),
+            },
+        }
+    }
+}
+
+/// `TuiWsClient`'s first write capability (Phase 10, plan 10-04, D-01): the
+/// TUI's wizard reaches the daemon's registry writer through this SAME
+/// `WorkflowCreator` seam the CLI uses -- never a bespoke wire call. Wraps
+/// `call(RequestPayload::CreateWorkflow(req))` exactly like
+/// `orchestrator-cli/src/ws_client.rs`'s own impl.
+#[async_trait]
+impl WorkflowCreator for TuiWsClient {
+    async fn create_workflow(&self, req: CreateWorkflowRequest) -> CreateWorkflowResponse {
+        match self.call(RequestPayload::CreateWorkflow(req)).await {
+            ResponsePayload::CreateWorkflow(resp) => resp,
+            other => CreateWorkflowResponse {
+                created: false,
+                workflow_path: None,
+                script_path: None,
+                error: Some(format!(
+                    "unexpected response payload from orchestratord: {other:?}"
+                )),
+            },
+        }
+    }
+}
+
+/// `TuiWsClient`'s `IntentCollisionChecker` implementation (Phase 10, plan
+/// 10-04, D-03/D-04): wraps `call_protocol` exactly like
+/// `orchestrator-cli/src/ws_client.rs`'s own impl. An unexpected reply
+/// variant and a transport `Err` alike map into a report with all three
+/// collision fields `None` and the failure text in `detail` -- never a
+/// panic, matching this file's established `failure_payload` discipline.
+#[async_trait]
+impl IntentCollisionChecker for TuiWsClient {
+    async fn check_intent_collision(&self, intent: &str) -> IntentCollisionReport {
+        match self
+            .call_protocol(ProtocolFrame::CheckIntentCollision {
+                intent: intent.to_string(),
+            })
+            .await
+        {
+            Ok(ProtocolFrame::IntentCollisionResult {
+                colliding_workflow_id,
+                colliding_intent,
+                similarity_score,
+                detail,
+                ..
+            }) => IntentCollisionReport {
+                colliding_workflow_id,
+                colliding_intent,
+                similarity_score,
+                detail,
+            },
+            Ok(other) => IntentCollisionReport {
+                colliding_workflow_id: None,
+                colliding_intent: None,
+                similarity_score: None,
+                detail: Some(format!("unexpected response frame from orchestratord: {other:?}")),
+            },
+            Err(err) => IntentCollisionReport {
+                colliding_workflow_id: None,
+                colliding_intent: None,
+                similarity_score: None,
+                detail: Some(err),
             },
         }
     }
