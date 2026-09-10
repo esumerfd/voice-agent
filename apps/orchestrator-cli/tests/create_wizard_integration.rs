@@ -32,7 +32,8 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use shared::{
-    AgentConfig, CreateWorkflowRequest, CreateWorkflowResponse, ParameterType, ProtocolFrame, WorkflowCreator,
+    AgentConfig, CreateWorkflowRequest, CreateWorkflowResponse, IntentCollisionChecker, IntentCollisionReport,
+    ParameterType, ProtocolFrame, WorkflowCreator,
 };
 use tempfile::TempDir;
 use tokio::net::TcpListener;
@@ -137,7 +138,7 @@ async fn guided_create_produces_exit_zero_and_writes_the_md_file() {
     let transcript = happy_path_transcript("brew_coffee", INTENT);
     let mut input = Cursor::new(transcript.into_bytes());
     let mut out = Vec::new();
-    let code = create_wizard::run(&client, &mut input, &mut out)
+    let code = create_wizard::run(&client, &client, &mut input, &mut out)
         .await
         .expect("create_wizard::run should not error on a valid transcript");
     let output = String::from_utf8(out).expect("captured output was not valid UTF-8");
@@ -160,7 +161,7 @@ async fn written_frontmatter_carries_intent_and_triggers() {
     let transcript = happy_path_transcript("brew_coffee", INTENT);
     let mut input = Cursor::new(transcript.into_bytes());
     let mut out = Vec::new();
-    let code = create_wizard::run(&client, &mut input, &mut out)
+    let code = create_wizard::run(&client, &client, &mut input, &mut out)
         .await
         .expect("create_wizard::run should not error on a valid transcript");
     assert_eq!(code, 0);
@@ -191,7 +192,7 @@ async fn created_workflow_is_routable_against_the_same_daemon_with_no_restart() 
     let transcript = happy_path_transcript("brew_coffee", INTENT);
     let mut input = Cursor::new(transcript.into_bytes());
     let mut out = Vec::new();
-    let code = create_wizard::run(&client, &mut input, &mut out)
+    let code = create_wizard::run(&client, &client, &mut input, &mut out)
         .await
         .expect("create_wizard::run should not error on a valid transcript");
     assert_eq!(code, 0);
@@ -230,7 +231,7 @@ async fn eof_before_the_final_answer_exits_nonzero_and_writes_nothing() {
     let transcript = "brew_coffee\n\n\n".to_string();
     let mut input = Cursor::new(transcript.into_bytes());
     let mut out = Vec::new();
-    let code = create_wizard::run(&client, &mut input, &mut out)
+    let code = create_wizard::run(&client, &client, &mut input, &mut out)
         .await
         .expect("create_wizard::run should not error on a truncated transcript");
 
@@ -292,10 +293,88 @@ impl WorkflowCreator for MockWorkflowCreator {
     }
 }
 
+/// A checker stub that always reports "no collision" -- used by every Task 2
+/// request-shape test above, which is not exercising the collision gate
+/// itself (that is Task 3's own behavior tests below).
+struct NoCollisionChecker;
+
+#[async_trait]
+impl IntentCollisionChecker for NoCollisionChecker {
+    async fn check_intent_collision(&self, _intent: &str) -> IntentCollisionReport {
+        IntentCollisionReport {
+            colliding_workflow_id: None,
+            colliding_intent: None,
+            similarity_score: None,
+            detail: None,
+        }
+    }
+}
+
+/// A checker stub returning a queue of canned reports (one per call, in
+/// call order; the queue's final report repeats once exhausted) -- drives
+/// Task 3's multi-report scenarios (e.g. "collision found, then revised
+/// intent clears it"). Also records the `WorkflowCreator` mock's own call
+/// counter at the moment EACH check is invoked -- the ordering-prohibition
+/// assertion (T-10-06): the creator's counter must be 0 every single time
+/// the checker runs, proving there is no path from any answer to a write
+/// that skips this gate.
+struct StubIntentCollisionChecker<'a> {
+    reports: Mutex<std::collections::VecDeque<IntentCollisionReport>>,
+    creator_calls: &'a AtomicUsize,
+    recorded_creator_calls_at_check: Mutex<Vec<usize>>,
+}
+
+impl<'a> StubIntentCollisionChecker<'a> {
+    fn new(creator_calls: &'a AtomicUsize, reports: Vec<IntentCollisionReport>) -> Self {
+        Self {
+            reports: Mutex::new(reports.into()),
+            creator_calls,
+            recorded_creator_calls_at_check: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn recorded_creator_calls_at_check(&self) -> Vec<usize> {
+        self.recorded_creator_calls_at_check.lock().expect("mutex poisoned").clone()
+    }
+}
+
+fn no_collision_report() -> IntentCollisionReport {
+    IntentCollisionReport {
+        colliding_workflow_id: None,
+        colliding_intent: None,
+        similarity_score: None,
+        detail: None,
+    }
+}
+
+#[async_trait]
+impl<'a> IntentCollisionChecker for StubIntentCollisionChecker<'a> {
+    async fn check_intent_collision(&self, _intent: &str) -> IntentCollisionReport {
+        self.recorded_creator_calls_at_check
+            .lock()
+            .expect("mutex poisoned")
+            .push(self.creator_calls.load(AtomicOrdering::SeqCst));
+        let mut queue = self.reports.lock().expect("mutex poisoned");
+        if queue.len() > 1 {
+            queue.pop_front().expect("checked len() > 1 above")
+        } else {
+            queue.front().cloned().unwrap_or_else(no_collision_report)
+        }
+    }
+}
+
 async fn run_wizard(transcript: &str, client: &dyn WorkflowCreator) -> (i32, String) {
+    run_wizard_with_checker(transcript, client, &NoCollisionChecker).await
+}
+
+async fn run_wizard_with_checker(
+    transcript: &str,
+    client: &dyn WorkflowCreator,
+    checker: &dyn IntentCollisionChecker,
+) -> (i32, String) {
     let mut input = Cursor::new(transcript.as_bytes().to_vec());
     let mut out = Vec::new();
-    let code = create_wizard::run(client, &mut input, &mut out)
+    let code = create_wizard::run(client, checker, &mut input, &mut out)
         .await
         .expect("create_wizard::run should not error");
     (code, String::from_utf8(out).expect("captured output was not valid UTF-8"))
@@ -613,6 +692,218 @@ fn cap_mirrors_match_the_real_writer_constants() {
         create_wizard::MAX_AGENT_FILE_LEN_MIRROR,
         orchestrator::registry::writer::MAX_AGENT_FILE_LEN
     );
+}
+
+// ---------------------------------------------------------------------
+// Task 3: the blocking, fail-closed Step 8 collision gate
+// ---------------------------------------------------------------------
+
+fn collision_report(id: &str, intent: &str, score: f32) -> IntentCollisionReport {
+    IntentCollisionReport {
+        colliding_workflow_id: Some(id.to_string()),
+        colliding_intent: Some(intent.to_string()),
+        similarity_score: Some(score),
+        detail: None,
+    }
+}
+
+fn degrade_report(detail: &str) -> IntentCollisionReport {
+    IntentCollisionReport {
+        colliding_workflow_id: None,
+        colliding_intent: None,
+        similarity_score: None,
+        detail: Some(detail.to_string()),
+    }
+}
+
+/// Base transcript through the end of Step 7 (parameters): id, blank
+/// display name, blank description, trigger `1` (cli), the given intent,
+/// handler `2` (markdown-body action), and `N` to stop adding parameters --
+/// everything up to (but not including) Step 8's collision gate.
+fn transcript_through_step_7(id: &str, intent: &str) -> String {
+    format!("{id}\n\n\n1\n{intent}\n2\nN\n")
+}
+
+/// Progress cue: the in-progress line is rendered before any collision
+/// verdict (here, the warning line for a detected collision).
+#[tokio::test]
+async fn progress_cue_appears_before_the_collision_warning() {
+    let mock = MockWorkflowCreator::new();
+    let checker =
+        StubIntentCollisionChecker::new(&mock.calls, vec![collision_report("make_coffee", "make a pot of coffee", 0.9)]);
+    // EOF at the save-anyway prompt -- enough to observe the progress cue
+    // and the warning without completing the flow.
+    let transcript = transcript_through_step_7("progress_wf", INTENT);
+    let (code, output) = run_wizard_with_checker(&transcript, &mock, &checker).await;
+
+    assert_ne!(code, 0, "expected EOF at the save-anyway prompt, output: {output}");
+    let progress_idx = output
+        .find("Checking for similar existing workflows...")
+        .expect("expected the progress line to be rendered");
+    let warn_idx = output.find("[WARN]").expect("expected a warning line to be rendered");
+    assert!(
+        progress_idx < warn_idx,
+        "expected the progress cue before the collision warning, got: {output}"
+    );
+    assert_eq!(checker.recorded_creator_calls_at_check(), vec![0], "T-10-06 ordering prohibition");
+    assert_eq!(mock.call_count(), 0);
+}
+
+/// Collision found, declined by a blank answer (D-04 fail-closed): the
+/// creator mock is never called.
+#[tokio::test]
+async fn collision_found_declined_by_blank_answer_writes_nothing() {
+    let mock = MockWorkflowCreator::new();
+    let checker =
+        StubIntentCollisionChecker::new(&mock.calls, vec![collision_report("make_coffee", "make a pot of coffee", 0.9)]);
+    // Blank line at the save-anyway prompt (decline), then EOF at the
+    // re-prompted intent step.
+    let transcript = format!("{}\n", transcript_through_step_7("blank_decline_wf", INTENT));
+    let (code, _output) = run_wizard_with_checker(&transcript, &mock, &checker).await;
+
+    assert_ne!(code, 0, "expected EOF at the re-prompted intent step");
+    assert_eq!(mock.call_count(), 0, "a declined collision must never reach create_workflow");
+    assert_eq!(checker.recorded_creator_calls_at_check(), vec![0], "T-10-06 ordering prohibition");
+}
+
+/// Collision found, declined by an explicit `n`: same as blank -- the
+/// creator mock is never called.
+#[tokio::test]
+async fn collision_found_declined_by_explicit_n_writes_nothing() {
+    let mock = MockWorkflowCreator::new();
+    let checker =
+        StubIntentCollisionChecker::new(&mock.calls, vec![collision_report("make_coffee", "make a pot of coffee", 0.9)]);
+    let transcript = format!("{}n\n", transcript_through_step_7("explicit_decline_wf", INTENT));
+    let (code, _output) = run_wizard_with_checker(&transcript, &mock, &checker).await;
+
+    assert_ne!(code, 0, "expected EOF at the re-prompted intent step");
+    assert_eq!(mock.call_count(), 0, "a declined collision must never reach create_workflow");
+    assert_eq!(checker.recorded_creator_calls_at_check(), vec![0], "T-10-06 ordering prohibition");
+}
+
+/// Declining returns control to Step 5 (the intent prompt), never Step 1
+/// (the id prompt) and never a full restart of the flow: the id prompt
+/// renders exactly once; the intent prompt renders twice (initial +
+/// re-prompt).
+#[tokio::test]
+async fn declining_returns_to_the_intent_step_not_a_full_restart() {
+    let mock = MockWorkflowCreator::new();
+    let checker =
+        StubIntentCollisionChecker::new(&mock.calls, vec![collision_report("make_coffee", "make a pot of coffee", 0.9)]);
+    let transcript = format!("{}n\nrevised intent\n", transcript_through_step_7("declines_wf", INTENT));
+    let (code, output) = run_wizard_with_checker(&transcript, &mock, &checker).await;
+
+    assert_ne!(
+        code, 0,
+        "expected EOF once the revised intent's own re-check reaches the save-anyway prompt again, output: {output}"
+    );
+    let id_prompt_count = output.matches("Workflow id (used as the .md filename):").count();
+    assert_eq!(id_prompt_count, 1, "expected the id prompt to render exactly once (no full restart), got: {output}");
+    let intent_prompt_count =
+        output.matches("Intent phrase (a sentence describing when this should fire").count();
+    assert_eq!(
+        intent_prompt_count, 2,
+        "expected the intent prompt to render once initially and once as the Step 5 re-prompt, got: {output}"
+    );
+    assert_eq!(mock.call_count(), 0);
+}
+
+/// Declining, then answering a revised intent whose second check reports no
+/// collision: the flow reaches review and a confirmed create calls the
+/// mock exactly once, carrying the REVISED intent.
+#[tokio::test]
+async fn revised_intent_that_clears_the_check_reaches_review_and_creates_once() {
+    let mock = MockWorkflowCreator::new();
+    let checker = StubIntentCollisionChecker::new(
+        &mock.calls,
+        vec![collision_report("make_coffee", "make a pot of coffee", 0.9), no_collision_report()],
+    );
+    let transcript = format!("{}n\nrevised intent\ny\n", transcript_through_step_7("revise_wf", INTENT));
+    let (code, output) = run_wizard_with_checker(&transcript, &mock, &checker).await;
+
+    assert_eq!(code, 0, "output: {output}");
+    assert_eq!(mock.call_count(), 1);
+    let req = mock.last_request();
+    assert_eq!(req.intent, Some("revised intent".to_string()));
+    assert_eq!(checker.recorded_creator_calls_at_check(), vec![0, 0], "T-10-06 ordering prohibition");
+}
+
+/// Collision found, overridden with `y`: the flow proceeds to review and a
+/// confirmed create calls the mock exactly once, carrying the ORIGINAL
+/// intent (not a revised one -- no revision happened).
+#[tokio::test]
+async fn overriding_the_collision_reaches_review_with_the_original_intent_and_creates_once() {
+    let mock = MockWorkflowCreator::new();
+    let checker =
+        StubIntentCollisionChecker::new(&mock.calls, vec![collision_report("make_coffee", "make a pot of coffee", 0.9)]);
+    let transcript = format!("{}y\ny\n", transcript_through_step_7("override_wf", INTENT));
+    let (code, output) = run_wizard_with_checker(&transcript, &mock, &checker).await;
+
+    assert_eq!(code, 0, "output: {output}");
+    assert_eq!(mock.call_count(), 1);
+    let req = mock.last_request();
+    assert_eq!(
+        req.intent,
+        Some(INTENT.to_string()),
+        "expected the ORIGINAL intent in the request after an override"
+    );
+    assert_eq!(checker.recorded_creator_calls_at_check(), vec![0], "T-10-06 ordering prohibition");
+}
+
+/// Warning content: the rendered warning line contains the similarity
+/// score, the colliding workflow's id, and its own intent text.
+#[tokio::test]
+async fn the_warning_line_contains_the_score_colliding_id_and_colliding_intent() {
+    let mock = MockWorkflowCreator::new();
+    let checker =
+        StubIntentCollisionChecker::new(&mock.calls, vec![collision_report("make_coffee", "make a pot of coffee", 0.9)]);
+    let transcript = transcript_through_step_7("warncontent_wf", INTENT);
+    let (code, output) = run_wizard_with_checker(&transcript, &mock, &checker).await;
+
+    assert_ne!(code, 0, "expected EOF at the save-anyway prompt");
+    assert!(output.contains("0.9000"), "expected the similarity score in the warning, got: {output}");
+    assert!(output.contains("make_coffee"), "expected the colliding workflow id in the warning, got: {output}");
+    assert!(
+        output.contains("make a pot of coffee"),
+        "expected the colliding intent text in the warning, got: {output}"
+    );
+}
+
+/// No collision: a report with all `None` fields renders no warning line
+/// and no save-anyway prompt, and the flow proceeds straight to review.
+#[tokio::test]
+async fn no_collision_renders_no_warning_and_proceeds_straight_to_review() {
+    let mock = MockWorkflowCreator::new();
+    let checker = StubIntentCollisionChecker::new(&mock.calls, vec![no_collision_report()]);
+    let transcript = format!("{}y\n", transcript_through_step_7("noclash_wf", INTENT));
+    let (code, output) = run_wizard_with_checker(&transcript, &mock, &checker).await;
+
+    assert_eq!(code, 0, "output: {output}");
+    assert!(!output.contains("[WARN]"), "expected no warning line, got: {output}");
+    assert!(!output.contains("Save anyway?"), "expected no save-anyway prompt, got: {output}");
+    assert_eq!(mock.call_count(), 1);
+    assert_eq!(checker.recorded_creator_calls_at_check(), vec![0], "T-10-06 ordering prohibition");
+}
+
+/// Degrade path: a report whose `detail` is `Some` and whose collision
+/// fields are all `None` renders the could-not-check warning, does NOT
+/// render a save-anyway prompt, and proceeds to review -- a confirmed
+/// create still calls the mock once.
+#[tokio::test]
+async fn degrade_path_warns_and_proceeds_without_a_save_anyway_prompt() {
+    let mock = MockWorkflowCreator::new();
+    let checker = StubIntentCollisionChecker::new(&mock.calls, vec![degrade_report("Ollama unreachable")]);
+    let transcript = format!("{}y\n", transcript_through_step_7("degrade_wf", INTENT));
+    let (code, output) = run_wizard_with_checker(&transcript, &mock, &checker).await;
+
+    assert_eq!(code, 0, "output: {output}");
+    assert!(
+        output.contains("[WARN] Could not check for similar workflows (Ollama unreachable)."),
+        "got: {output}"
+    );
+    assert!(!output.contains("Save anyway?"), "expected no save-anyway prompt on the degrade path, got: {output}");
+    assert_eq!(mock.call_count(), 1);
+    assert_eq!(checker.recorded_creator_calls_at_check(), vec![0], "T-10-06 ordering prohibition");
 }
 
 // ---------------------------------------------------------------------

@@ -43,7 +43,8 @@
 use std::io::{BufRead, Write};
 
 use shared::{
-    AgentConfig, CreateWorkflowRequest, ParameterDescriptor, ParameterType, WorkflowCreator, WorkflowWriteMode,
+    AgentConfig, CreateWorkflowRequest, IntentCollisionChecker, ParameterDescriptor, ParameterType,
+    WorkflowCreator, WorkflowWriteMode,
 };
 
 use crate::create::{agent_config_from_flags, derive_display_name, parse_param, AgentFlags};
@@ -213,7 +214,12 @@ fn validate_agent_file_client(entry: &str) -> Result<(), WizardError> {
 /// Runs the guided `workflow create` Q&A flow end to end. Returns the
 /// process exit code (0 = success, nonzero = any failure). EOF at any
 /// prompt returns nonzero and performs no write.
-pub async fn run<R: BufRead, W: Write>(client: &dyn WorkflowCreator, input: &mut R, out: &mut W) -> std::io::Result<i32> {
+pub async fn run<R: BufRead, W: Write>(
+    client: &dyn WorkflowCreator,
+    checker: &dyn IntentCollisionChecker,
+    input: &mut R,
+    out: &mut W,
+) -> std::io::Result<i32> {
     let Some(id) = prompt_id(input, out)? else {
         return Ok(1);
     };
@@ -270,10 +276,14 @@ pub async fn run<R: BufRead, W: Write>(client: &dyn WorkflowCreator, input: &mut
         parameters,
     };
 
-    // Step 8 (D-03/D-04): a no-op placeholder seam in this plan -- plan
-    // 10-02 fills it in with the real embedding-based collision check
-    // against every existing workflow's intent.
-    let _ = passes_collision_check(&answers);
+    // Step 8 (D-03/D-04): the blocking, fail-closed semantic-collision gate.
+    // Placed strictly between parameter collection and the review/write
+    // loop below -- there is structurally no path from any answer here to a
+    // write that skips this gate (the single `create_workflow` call site is
+    // downstream of this loop, never inside it).
+    let Some(()) = run_collision_check(checker, input, out, &mut answers).await? else {
+        return Ok(1);
+    };
 
     loop {
         render_review(out, &answers)?;
@@ -323,12 +333,102 @@ pub async fn run<R: BufRead, W: Write>(client: &dyn WorkflowCreator, input: &mut
     }
 }
 
-/// Step 8 seam (D-03/D-04): plan 10-02 implements the real Ollama-embedding
-/// cosine-similarity collision check here. A no-op placeholder in this
-/// plan -- always reports "no collision found", so Step 9 (Review) is
-/// always reached directly.
-fn passes_collision_check(_answers: &WizardAnswers) -> bool {
-    true
+/// Step 8 (D-03/D-04): the blocking, fail-closed semantic-collision gate.
+/// Implements the five states from UI-SPEC's Collision-check table:
+///
+/// - the in-progress line is rendered immediately before the checker call,
+///   so a multi-second local-model turn never reads as a silent hang;
+/// - a report with no colliding workflow and no `detail` (no prior
+///   workflows, or a checked-and-clean intent) proceeds silently to review;
+/// - a report naming a colliding workflow renders the warning line (score,
+///   colliding id, colliding intent, both debug-quoted -- T-10-09, a
+///   deliberate divergence from UI-SPEC's literal single-quote copy, since
+///   another workflow's authored intent is untrusted input that must never
+///   be able to forge an extra rendered line), then the save-anyway prompt
+///   whose default is DECLINE;
+/// - declining returns control to Step 5 (the intent-phrase prompt) so the
+///   user can revise the wording, then the check re-runs against the
+///   REVISED intent -- never step 1, never a full restart;
+/// - a report carrying only a `detail` (the check itself failed) renders
+///   the could-not-check warning and proceeds to review WITHOUT a
+///   save-anyway prompt. This asymmetry is DELIBERATE and is UI-SPEC's own
+///   design default, not a weakening of D-04: D-04 blocks on a DETECTED
+///   collision, and hard-blocking wizard completion on a local-service
+///   outage would defeat CREATEUI-01/02's own goal of a fast, low-friction
+///   creation path.
+///
+/// Returns `Ok(None)` on EOF at any prompt within this gate (mirroring
+/// every other step's EOF discipline) -- the caller returns exit code 1
+/// with no write.
+async fn run_collision_check<R: BufRead, W: Write>(
+    checker: &dyn IntentCollisionChecker,
+    input: &mut R,
+    out: &mut W,
+    answers: &mut WizardAnswers,
+) -> std::io::Result<Option<()>> {
+    loop {
+        writeln!(out, "Checking for similar existing workflows...")?;
+        let report = checker.check_intent_collision(&answers.intent).await;
+
+        match (report.colliding_workflow_id, report.colliding_intent, report.similarity_score) {
+            (Some(colliding_id), Some(colliding_intent), Some(score)) => {
+                writeln!(
+                    out,
+                    "[WARN] '{}' is {score:.4} similar to existing workflow {:?} ({:?}). This may \
+                     cause the router to confuse the two when routing by voice/utterance.",
+                    answers.intent, colliding_id, colliding_intent
+                )?;
+                let Some(save_anyway) = prompt_save_anyway(input, out, "Save anyway? [y/N]:")? else {
+                    return Ok(None);
+                };
+                if save_anyway {
+                    return Ok(Some(()));
+                }
+                // Declined (fail-closed, D-04): return to Step 5 to revise
+                // the wording, then re-run this same check against the
+                // revised intent -- never step 1, never a full restart.
+                let Some(new_intent) = prompt_intent(input, out)? else {
+                    return Ok(None);
+                };
+                answers.intent = new_intent;
+            }
+            (None, None, None) => {
+                if let Some(detail) = report.detail {
+                    writeln!(
+                        out,
+                        "[WARN] Could not check for similar workflows ({detail}). Proceeding \
+                         without a collision check -- you may want to verify '{}' doesn't overlap \
+                         with an existing workflow's intent manually.",
+                        answers.intent
+                    )?;
+                }
+                // Either a clean "no collision" reply, or (when `detail` is
+                // `Some`) the degrade path above -- both proceed straight to
+                // review, per UI-SPEC's Collision-check table.
+                return Ok(Some(()));
+            }
+            // Every real reply is either "all three collision fields Some"
+            // or "all three None" (see `IntentCollisionReport`'s own doc
+            // comment) -- a partially-populated reply cannot come from
+            // either implementation of the trait. Treat it exactly like the
+            // "no collision" branch (fail toward completing the wizard, not
+            // toward blocking it) rather than panicking on a shape that
+            // should be structurally unreachable.
+            _ => return Ok(Some(())),
+        }
+    }
+}
+
+/// The save-anyway prompt (D-04, Step 8): default DECLINE -- a blank
+/// answer, or anything other than an explicit `y`/`Y`, does not save.
+/// Deliberately the OPPOSITE default of `prompt_confirm`'s `[Y/n]` review
+/// gate, because this prompt guards a risky action (saving a workflow whose
+/// intent may confuse the router) rather than confirming an expected one.
+fn prompt_save_anyway<R: BufRead, W: Write>(input: &mut R, out: &mut W, prompt: &str) -> std::io::Result<Option<bool>> {
+    let Some(raw) = prompt_line(input, out, prompt)? else {
+        return Ok(None);
+    };
+    Ok(Some(matches!(raw.trim(), "y" | "Y")))
 }
 
 /// Derives the request's `(description, script)` pair from the selected

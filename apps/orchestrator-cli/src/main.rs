@@ -21,7 +21,7 @@ mod ws_client;
 
 use clap::Parser;
 use cli::{Cli, Commands, WorkflowCommands};
-use shared::{OrchestratorClient, WorkflowCreator, WorkflowDeleter, WorkflowWriteMode};
+use shared::{IntentCollisionChecker, OrchestratorClient, WorkflowCreator, WorkflowDeleter, WorkflowWriteMode};
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> std::io::Result<()> {
@@ -101,8 +101,13 @@ async fn main() -> std::io::Result<()> {
                     .await?
                 }
                 (None, None) => {
-                    create_wizard::run(&client as &dyn WorkflowCreator, &mut std::io::stdin().lock(), &mut std::io::stdout())
-                        .await?
+                    create_wizard::run(
+                        &client as &dyn WorkflowCreator,
+                        &client as &dyn IntentCollisionChecker,
+                        &mut std::io::stdin().lock(),
+                        &mut std::io::stdout(),
+                    )
+                    .await?
                 }
                 (id, source) => {
                     eprintln!(
