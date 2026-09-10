@@ -26,10 +26,12 @@ use ratatui::widgets::{
 };
 use ratatui::Frame;
 use serde_json::Value;
-use shared::{ActivityLogEvent, ActivityPhase, ActivityStatus};
+use shared::wizard::{self as wizard_contract, HandlerChoice, Step};
+use shared::{ActivityLogEvent, ActivityPhase, ActivityStatus, ParameterDescriptor, ParameterType};
 
 use crate::app::{Activity, App, Focus};
 use crate::event::{HintScope, KEY_HINTS};
+use crate::wizard::WizardState;
 
 /// Renders the full locked ROADMAP layout into `frame` from `app`'s current
 /// state. `port` is the daemon WS port this client connected to (header
@@ -68,6 +70,15 @@ pub fn render(frame: &mut Frame, app: &mut App, port: u16) {
 }
 
 fn render_body(frame: &mut Frame, area: Rect, app: &mut App) {
+    // Phase 10, plan 10-04: the wizard is an ADDITIVE render branch for
+    // `Focus::Wizard` only -- `render_list`/`render_tabs_and_detail` (the
+    // existing read-only Activities/Detail surfaces) are never threaded
+    // wizard-only fields, per this plan's own prohibition.
+    if app.focus() == Focus::Wizard {
+        render_wizard(frame, area, app);
+        return;
+    }
+
     if active_activity(app).is_none() {
         render_list(frame, area, app);
         return;
@@ -82,6 +93,321 @@ fn render_body(frame: &mut Frame, area: Rect, app: &mut App) {
     render_tabs_and_detail(frame, body[1], app);
 }
 
+// -- Phase 10, plan 10-04: the wizard screen ----------------------------
+//
+// Reuses `render`'s four-constraint vertical chrome and `render_body`'s
+// fifty-fifty horizontal split verbatim (UI-SPEC's Terminal Layout
+// conventions) -- `render_wizard` and its two panes replace `render_list`/
+// `render_tabs_and_detail` for `Focus::Wizard` ONLY, never threading a
+// wizard-only field through either of those functions. Every rendered
+// prompt/label/menu line comes from `shared::wizard` -- this file declares
+// no wizard copy of its own. Colors: `Color::Green` for the terminal
+// success line only, `Color::Red` for validation/server errors only,
+// `Color::Yellow` for the collision warning banner only -- no other wizard
+// element uses those three (UI-SPEC's Color section). Status tags are
+// bracketed ASCII words (`[OK]`/`[WARN]`/`[ERROR]`), never a Unicode glyph.
+
+/// The `Focus::Wizard` body branch (Task 2 D-1): a fresh success screen once
+/// the daemon confirms the write, otherwise the fifty-fifty split -- the
+/// running summary of already-answered fields on the left, the active
+/// step's prompt/input/error on the right.
+pub fn render_wizard(frame: &mut Frame, area: Rect, app: &App) {
+    let Some(state) = app.wizard() else {
+        return;
+    };
+
+    if let Some(path) = state.success_path() {
+        render_wizard_success(frame, area, &state.answers().id, path);
+        return;
+    }
+
+    let body = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(area);
+
+    render_wizard_summary(frame, body[0], state);
+    render_wizard_active_field(frame, body[1], state);
+}
+
+/// The summary-row step-position text under `Focus::Wizard` (Task 2 D-2):
+/// pure and terminal-free, so it's unit-tested directly without a
+/// `TestBackend`. `Step::ORDERED`'s fixed 12-step denominator is used even
+/// on a non-agent run that skips the three agent-only sub-steps -- a stable
+/// total is more useful than one that jumps as the handler choice branches.
+pub fn wizard_step_indicator(step: Step) -> String {
+    let total = wizard_step_index(Step::ORDERED[Step::ORDERED.len() - 1]) + 1;
+    let position = wizard_step_index(step) + 1;
+    format!("Step {position}/{total}")
+}
+
+/// `step`'s 0-based position within `Step::ORDERED` -- the single place
+/// every "has this field already been answered" comparison in the summary
+/// pane is computed from, so it can never drift from the step indicator's
+/// own numbering.
+fn wizard_step_index(step: Step) -> usize {
+    Step::ORDERED.iter().position(|s| *s == step).unwrap_or(0)
+}
+
+/// The left pane (Task 2 D-3): a running summary of already-answered
+/// fields. Reuses `render_list`'s established `List`/pane-block pattern in
+/// spirit, but renders only the LAST rows that fit the pane's inner height
+/// (never all of them) -- always including the most recently answered
+/// field, the truncation-tail fallback this plan's own text names as
+/// acceptable when scrolling alone would need a stored, stateful
+/// `ListState` this pure render function does not have. This is what makes
+/// backstop 2 (the many-parameters overflow check) hold.
+///
+/// Deliberately renders NO `Block` border: ratatui's default border glyphs
+/// (`┌`/`─`/`│`, U+2500 range) are not ASCII, and this screen's own no-glyph
+/// contract (UI-SPEC's Icon library row) requires every rendered cell to
+/// stay byte-identical across terminal encodings -- a plain text title line
+/// keeps the pane distinguishable without spending the border budget on a
+/// non-ASCII character set.
+pub fn render_wizard_summary(frame: &mut Frame, area: Rect, state: &WizardState) {
+    let mut lines = vec![Line::from("Summary")];
+    let body = wizard_summary_lines(state);
+    let inner_h = (area.height as usize).saturating_sub(lines.len()).max(1);
+    let start = body.len().saturating_sub(inner_h);
+    lines.extend(body[start..].iter().cloned());
+
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+/// Builds every already-answered field's summary line, in step order.
+/// `wizard_step_index` gates each field on the CURRENT step having already
+/// passed it, except Parameters, which grows live line-by-line as `y`
+/// answers add entries even before the loop itself ends -- what backstop
+/// 2's test exercises.
+fn wizard_summary_lines(state: &WizardState) -> Vec<Line<'static>> {
+    let answers = state.answers();
+    let idx = wizard_step_index(state.step());
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    if idx > wizard_step_index(Step::Id) {
+        lines.push(Line::from(format!("Id: {}", answers.id)));
+    }
+    if idx > wizard_step_index(Step::DisplayName) {
+        let name = answers
+            .display_name
+            .clone()
+            .unwrap_or_else(|| wizard_contract::derive_display_name(&answers.id));
+        lines.push(Line::from(format!("Display name: {name}")));
+    }
+    if idx > wizard_step_index(Step::Description) {
+        let desc = if answers.description.is_empty() {
+            "(none)".to_string()
+        } else {
+            answers.description.clone()
+        };
+        lines.push(Line::from(format!("Description: {desc}")));
+    }
+    if idx > wizard_step_index(Step::Triggers) {
+        lines.push(Line::from(format!("Triggers: {}", answers.triggers.join(", "))));
+    }
+    if idx > wizard_step_index(Step::Intent) {
+        lines.push(Line::from(format!("Intent: {}", answers.intent)));
+    }
+    if let Some(handler) = answers.handler {
+        if idx > wizard_step_index(Step::HandlerType) {
+            lines.push(Line::from(format!("Handler: {}", handler_label(handler))));
+        }
+        if handler == HandlerChoice::Agent {
+            if idx > wizard_step_index(Step::AgentFiles) {
+                lines.push(Line::from(format!("Agent files: {}", answers.agent_files.len())));
+            }
+            if idx > wizard_step_index(Step::AgentTimeout) {
+                let timeout = answers
+                    .timeout_secs
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "(default)".to_string());
+                lines.push(Line::from(format!("Timeout: {timeout}")));
+            }
+            if idx > wizard_step_index(Step::AgentBudget) {
+                let budget = answers
+                    .max_budget_usd
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "(default)".to_string());
+                lines.push(Line::from(format!("Budget: {budget}")));
+            }
+        }
+    }
+    if idx > wizard_step_index(Step::Parameters) || !answers.parameters.is_empty() {
+        lines.extend(parameter_lines(&answers.parameters));
+    }
+
+    lines
+}
+
+/// UI-SPEC's exact review-summary shape for the parameters list (Task 2
+/// D-4/D-5): `Parameters: none` for zero, or a `Parameters:` heading
+/// followed by one indented `  - {name}: {type} ({required|optional})` line
+/// per entry -- identical copy for one entry or many, no singular/plural
+/// variation. Shared by both the left pane's running summary (once any
+/// parameter exists) and the Review screen, so the two can never render
+/// this list differently.
+fn parameter_lines(parameters: &[ParameterDescriptor]) -> Vec<Line<'static>> {
+    if parameters.is_empty() {
+        return vec![Line::from("Parameters: none")];
+    }
+    let mut lines = vec![Line::from("Parameters:")];
+    for p in parameters {
+        let required = if p.required { "required" } else { "optional" };
+        lines.push(Line::from(format!(
+            "  - {}: {} ({required})",
+            p.name,
+            parameter_type_label(p.type_)
+        )));
+    }
+    lines
+}
+
+/// UI-SPEC's lowercase type labels (`string`/`int`/`bool`) -- matching what
+/// the wizard's own Step 7 sub-form prompts the user to type, not Rust's
+/// capitalized `Debug` form.
+fn parameter_type_label(t: ParameterType) -> &'static str {
+    match t {
+        ParameterType::String => "string",
+        ParameterType::Int => "int",
+        ParameterType::Bool => "bool",
+    }
+}
+
+/// UI-SPEC Step 6's handler labels, without the menu numbering (used in the
+/// summary/review panes, where a numbered choice no longer applies).
+fn handler_label(handler: HandlerChoice) -> &'static str {
+    match handler {
+        HandlerChoice::ScriptAction => "Script-backed action",
+        HandlerChoice::MarkdownAction => "Markdown-body action",
+        HandlerChoice::Agent => "Agent (Claude-backed)",
+    }
+}
+
+/// The right pane (Task 2 D-3): the active step's prompt, its input buffer,
+/// and any field error, as a `Paragraph` with `Wrap` -- the same wrapped-
+/// paragraph pattern `render_detail_panel` already proves. This is what
+/// makes backstop 1 (long-text wrap) hold. `Step::CollisionCheck` and
+/// `Step::Review` each get their own dedicated rendering; every other step
+/// renders its prompt, any menu lines, a field-error line (red) if the last
+/// `advance()` was rejected, and the live buffer echo.
+pub fn render_wizard_active_field(frame: &mut Frame, area: Rect, state: &WizardState) {
+    let mut lines: Vec<Line<'static>> = vec![Line::from("Field")];
+
+    if let Some(message) = state.server_error() {
+        lines.push(Line::from(Span::styled(
+            format!("[ERROR] {message}"),
+            Style::new().fg(Color::Red),
+        )));
+    }
+
+    match state.step() {
+        Step::CollisionCheck => render_collision_lines(&mut lines, state),
+        Step::Review => render_review_lines(&mut lines, state),
+        step => {
+            lines.push(Line::from(wizard_contract::prompt_for(step, &state.answers().id)));
+            for menu_line in wizard_contract::menu_lines_for(step) {
+                lines.push(Line::from(menu_line));
+            }
+            if let Some(err) = state.field_error() {
+                lines.push(Line::from(Span::styled(err.line(), Style::new().fg(Color::Red))));
+            }
+            lines.push(Line::from(format!("> {}", state.buffer())));
+        }
+    }
+
+    // No `Block` border here either -- see `render_wizard_summary`'s doc
+    // comment for why (the no-glyph, ASCII-only contract).
+    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+    frame.render_widget(paragraph, area);
+}
+
+/// `Step::CollisionCheck`'s own five-state rendering (D-03/D-04, UI-SPEC's
+/// Collision-check table): the in-progress line while the checker call is
+/// in flight; the yellow warning banner (score, colliding id, colliding
+/// intent -- Rust `Debug` quoting, T-10-09, since another workflow's
+/// authored intent is untrusted data) plus the save-anyway buffer echo for
+/// a real collision; the yellow could-not-check notice for a degraded
+/// check, with NO save-anyway prompt; nothing extra for a clean check
+/// (`apply_collision_report` has already moved on to `Step::Review` by
+/// then, so this arm is reached only transiently or defensively).
+fn render_collision_lines(lines: &mut Vec<Line<'static>>, state: &WizardState) {
+    if state.collision_check_in_flight() {
+        lines.push(Line::from(wizard_contract::prompt_for(Step::CollisionCheck, "")));
+        return;
+    }
+
+    match state.collision_report() {
+        Some(report) if report.colliding_workflow_id.is_some() => {
+            let score = report.similarity_score.unwrap_or_default();
+            let colliding_id = report.colliding_workflow_id.clone().unwrap_or_default();
+            let colliding_intent = report.colliding_intent.clone().unwrap_or_default();
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "[WARN] similarity {score:.4} to existing workflow {colliding_id:?} ({colliding_intent:?}). \
+                     This may cause the router to confuse the two when routing by voice/utterance."
+                ),
+                Style::new().fg(Color::Yellow),
+            )));
+            lines.push(Line::from("Save anyway? [y/N]:"));
+            lines.push(Line::from(format!("> {}", state.buffer())));
+        }
+        Some(report) => {
+            if let Some(detail) = &report.detail {
+                lines.push(Line::from(Span::styled(
+                    format!("[WARN] Could not check for similar workflows ({detail})."),
+                    Style::new().fg(Color::Yellow),
+                )));
+            }
+        }
+        None => {
+            lines.push(Line::from(wizard_contract::prompt_for(Step::CollisionCheck, "")));
+        }
+    }
+}
+
+/// `Step::Review`'s full summary (UI-SPEC's Step 9): every collected answer,
+/// the shared `parameter_lines` list (identical copy to the left pane's own
+/// rendering once any parameter exists), and the final create prompt --
+/// `Enter` (the wizard's own footer-advertised advance key) submits, no
+/// separate `[Y/n]` buffer answer needed, unlike the CLI's stdin-driven
+/// review loop.
+fn render_review_lines(lines: &mut Vec<Line<'static>>, state: &WizardState) {
+    let answers = state.answers();
+    lines.push(Line::from("Review:"));
+    lines.push(Line::from(format!("Id: {}", answers.id)));
+    let name = answers
+        .display_name
+        .clone()
+        .unwrap_or_else(|| wizard_contract::derive_display_name(&answers.id));
+    lines.push(Line::from(format!("Display name: {name}")));
+    lines.push(Line::from(format!("Triggers: {}", answers.triggers.join(", "))));
+    lines.push(Line::from(format!("Intent: {}", answers.intent)));
+    if let Some(handler) = answers.handler {
+        lines.push(Line::from(format!("Handler: {}", handler_label(handler))));
+    }
+    lines.extend(parameter_lines(&answers.parameters));
+    lines.push(Line::from(format!(
+        "Create workflow '{}'? Press Enter to create.",
+        answers.id
+    )));
+}
+
+/// The terminal success screen (UI-SPEC's Terminal states table): the `[OK]`
+/// line in green naming the written path, plus the try-it-now line that
+/// directly demonstrates CREATEUI-02's same-session, no-restart guarantee.
+fn render_wizard_success(frame: &mut Frame, area: Rect, id: &str, workflow_path: &str) {
+    // No `Block` border -- see `render_wizard_summary`'s doc comment for
+    // why (the no-glyph, ASCII-only contract).
+    let lines = vec![
+        Line::from(Span::styled(
+            format!("[OK] Workflow '{id}' created at {workflow_path}."),
+            Style::new().fg(Color::Green),
+        )),
+        Line::from(format!("Try it now: orchestrator run {id}")),
+    ];
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
 fn render_header(frame: &mut Frame, area: Rect, port: u16) {
     let pid = std::process::id();
     let now = format_now();
@@ -91,6 +417,17 @@ fn render_header(frame: &mut Frame, area: Rect, port: u16) {
 }
 
 fn render_summary(frame: &mut Frame, area: Rect, app: &App) {
+    // Phase 10, plan 10-04: under `Focus::Wizard` the summary row carries
+    // the step-position indicator instead of the Activities running/total
+    // count -- the wizard's own step machine, not the activity list, is
+    // what the user is looking at.
+    if app.focus() == Focus::Wizard {
+        if let Some(state) = app.wizard() {
+            frame.render_widget(Paragraph::new(wizard_step_indicator(state.step())), area);
+        }
+        return;
+    }
+
     let running = app
         .activities()
         .iter()

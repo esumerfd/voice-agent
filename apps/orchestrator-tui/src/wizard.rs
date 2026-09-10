@@ -32,7 +32,10 @@
 #![allow(dead_code)]
 
 use shared::wizard::{self, FieldError, HandlerChoice, Step};
-use shared::{AgentConfig, CreateWorkflowRequest, ParameterDescriptor, ParameterType, WorkflowWriteMode};
+use shared::{
+    AgentConfig, CreateWorkflowRequest, IntentCollisionReport, ParameterDescriptor, ParameterType,
+    WorkflowWriteMode,
+};
 
 /// The full, in-progress answer set (mirrors
 /// `orchestrator-cli::create_wizard::WizardAnswers`) -- only converted into
@@ -81,9 +84,28 @@ pub struct WizardState {
     param_substep: ParamSubStep,
     param_draft_name: String,
     param_draft_type: String,
-    /// Set by 10-04's async collision-check call; declared here so 10-04
-    /// adds no new state shape to this struct.
+    /// Set by 10-04's async collision-check call.
     collision_check_in_flight: bool,
+    /// The most recent collision-check reply (Phase 10, plan 10-04,
+    /// D-03/D-04). `Some` with `colliding_workflow_id: Some(..)` gates
+    /// `advance()` behind the save-anyway buffer answer; `Some` with only
+    /// `detail` (a degraded check) or `None` (a clean check) has already
+    /// been resolved by `apply_collision_report` -- see that method's own
+    /// doc comment for the full state machine.
+    collision_report: Option<IntentCollisionReport>,
+    /// Set once the daemon confirms the write succeeded (Phase 10, plan
+    /// 10-04): the absolute path of the written `.md`. `Some` short-circuits
+    /// every other rendering -- the wizard is done, showing only the
+    /// success screen until the caller closes it.
+    success_path: Option<String>,
+    /// Set when the daemon rejects the write itself (e.g. a duplicate id),
+    /// distinct from `field_error` (client-side pre-validation): rendered
+    /// verbatim as `[ERROR] {message}` per UI-SPEC's server-side-rejection
+    /// row, which does NOT use the generic `[ERROR] {field} {reason}.`
+    /// shape `FieldError::line()` produces. Setting this also resets `step`
+    /// back to `Step::Id` so only the offending field re-prompts (never a
+    /// full restart) -- see `set_server_error`.
+    server_error: Option<String>,
 }
 
 impl Default for WizardState {
@@ -106,6 +128,9 @@ impl WizardState {
             param_draft_name: String::new(),
             param_draft_type: String::new(),
             collision_check_in_flight: false,
+            collision_report: None,
+            success_path: None,
+            server_error: None,
         }
     }
 
@@ -144,6 +169,69 @@ impl WizardState {
     /// Sets the collision-check-in-flight flag (10-04 consumes this).
     pub fn set_collision_check_in_flight(&mut self, in_flight: bool) {
         self.collision_check_in_flight = in_flight;
+    }
+
+    /// The most recent collision-check reply, if any -- rendered as the
+    /// warning banner (a real collision), the degrade notice (`detail`
+    /// only), or nothing (a clean check already resolved to `None`).
+    pub fn collision_report(&self) -> Option<&IntentCollisionReport> {
+        self.collision_report.as_ref()
+    }
+
+    /// Records the async collision-check reply (Phase 10, plan 10-04,
+    /// D-03/D-04), called once by the caller after the checker's `.await`
+    /// resolves. A report naming a real collision STAYS on
+    /// `Step::CollisionCheck`, gating further progress behind the
+    /// save-anyway buffer answer -- `advance()` resolves it (see
+    /// `advance_collision_check`). A report with no collision (a clean
+    /// check, or a degraded one carrying only `detail`) advances straight to
+    /// `Step::Review` -- UI-SPEC's own non-blocking design default for a
+    /// degraded check, and there being nothing left to decide for a clean
+    /// one. A degrade's `detail` is retained (not cleared) so the caller can
+    /// still render it; a clean report is discarded outright.
+    pub fn apply_collision_report(&mut self, report: IntentCollisionReport) {
+        let is_real_collision = report.colliding_workflow_id.is_some();
+        let has_detail = report.detail.is_some();
+        if is_real_collision {
+            self.collision_report = Some(report);
+        } else if has_detail {
+            self.collision_report = Some(report);
+            self.commit_and_move_to(Step::Review);
+        } else {
+            self.collision_report = None;
+            self.commit_and_move_to(Step::Review);
+        }
+    }
+
+    /// The absolute path of the just-written `.md`, once the daemon has
+    /// confirmed the create succeeded -- `Some` means the wizard is done and
+    /// showing only the terminal success screen.
+    pub fn success_path(&self) -> Option<&str> {
+        self.success_path.as_deref()
+    }
+
+    /// Records a successful create (Phase 10, plan 10-04): the wizard's
+    /// terminal success state.
+    pub fn set_success(&mut self, workflow_path: String) {
+        self.success_path = Some(workflow_path);
+    }
+
+    /// The daemon's own rejection text (e.g. a duplicate id), if the most
+    /// recent write attempt failed server-side -- distinct from
+    /// `field_error`'s client-side pre-validation shape.
+    pub fn server_error(&self) -> Option<&str> {
+        self.server_error.as_deref()
+    }
+
+    /// Records a server-side write rejection (Phase 10, plan 10-04) and
+    /// returns to `Step::Id` so only the offending field re-prompts --
+    /// mirrors the CLI's own "re-prompt Step 1 only, never a full restart"
+    /// discipline.
+    pub fn set_server_error(&mut self, message: String) {
+        self.server_error = Some(message);
+        self.step = Step::Id;
+        self.buffer.clear();
+        self.field_error = None;
     }
 
     /// Appends a character to the active field's buffer, in order. Never
@@ -221,6 +309,7 @@ impl WizardState {
         match wizard::validate_id(&id) {
             Ok(()) => {
                 self.answers.id = id;
+                self.server_error = None;
                 self.commit_and_move_to(Step::DisplayName);
             }
             Err(err) => self.field_error = Some(err),
@@ -392,11 +481,29 @@ impl WizardState {
         }
     }
 
-    /// Step 8: the collision check itself is 10-04's scope (a real async
-    /// call gated by `collision_check_in_flight`). This plan's step machine
-    /// only owns the transition to `Review`.
+    /// Step 8's save-anyway gate (Phase 10, plan 10-04, D-03/D-04): resolves
+    /// a REAL collision (`apply_collision_report` left one pending) against
+    /// the buffer's `y`/`Y` answer -- confirming clears the report and moves
+    /// to `Step::Review`; declining clears the report and returns to
+    /// `Step::Intent` so the wording can be revised (fail-closed, never a
+    /// full restart). Called with no real collision pending (a clean/
+    /// degraded report already auto-advanced via `apply_collision_report`,
+    /// or the check hasn't run yet) is a defensive no-op -- there is nothing
+    /// here to resolve.
     fn advance_collision_check(&mut self) {
-        self.commit_and_move_to(Step::Review);
+        let Some(report) = self.collision_report.clone() else {
+            return;
+        };
+        if report.colliding_workflow_id.is_none() {
+            return;
+        }
+        if matches!(self.buffer.trim(), "y" | "Y") {
+            self.collision_report = None;
+            self.commit_and_move_to(Step::Review);
+        } else {
+            self.collision_report = None;
+            self.commit_and_move_to(Step::Intent);
+        }
     }
 
     /// Clears the field error and buffer, then moves to `next` -- the
@@ -479,6 +586,39 @@ impl WizardState {
             intent: Some(self.answers.intent.clone()),
             triggers: self.answers.triggers.clone(),
         }
+    }
+}
+
+/// Test-only construction helpers (Phase 10, plan 10-04, Task 2): let
+/// render tests -- both this file's own `#[cfg(test)] mod tests` below and
+/// `tests/wizard_render_integration.rs`'s external `#[path]` inclusion of
+/// this file -- build an arbitrary mid-flow `WizardState` directly, without
+/// driving the real step-by-step `advance()` sequence for every field.
+/// `#[cfg(test)]` on the `impl` block (not just individual methods) keeps
+/// every one of these entirely out of the shipped, non-test binary.
+#[cfg(test)]
+impl WizardState {
+    /// Jumps directly to `step` with the given `answers`, bypassing the
+    /// real sequence -- e.g. to render the Review screen with a specific
+    /// parameter list without re-typing every prior field.
+    pub fn test_at_step(step: Step, answers: WizardAnswers) -> Self {
+        let mut state = Self::new();
+        state.step = step;
+        state.answers = answers;
+        state
+    }
+
+    /// Overwrites the active field's input buffer directly.
+    pub fn test_set_buffer(&mut self, buffer: impl Into<String>) {
+        self.buffer = buffer.into();
+    }
+
+    /// Overwrites the collision report directly, WITHOUT running
+    /// `apply_collision_report`'s transition logic (no auto-advance) -- lets
+    /// render tests pin an arbitrary `(step, collision_report)` pairing that
+    /// the real state machine would only ever pass through transiently.
+    pub fn test_set_collision_report(&mut self, report: Option<IntentCollisionReport>) {
+        self.collision_report = report;
     }
 }
 
@@ -744,15 +884,154 @@ mod tests {
         assert_eq!(state.step(), Step::CollisionCheck);
     }
 
+    fn no_collision_report() -> IntentCollisionReport {
+        IntentCollisionReport {
+            colliding_workflow_id: None,
+            colliding_intent: None,
+            similarity_score: None,
+            detail: None,
+        }
+    }
+
+    fn degraded_report(detail: &str) -> IntentCollisionReport {
+        IntentCollisionReport {
+            colliding_workflow_id: None,
+            colliding_intent: None,
+            similarity_score: None,
+            detail: Some(detail.to_string()),
+        }
+    }
+
+    fn colliding_report(id: &str, intent: &str, score: f32) -> IntentCollisionReport {
+        IntentCollisionReport {
+            colliding_workflow_id: Some(id.to_string()),
+            colliding_intent: Some(intent.to_string()),
+            similarity_score: Some(score),
+            detail: None,
+        }
+    }
+
     #[test]
-    fn collision_check_advances_to_review() {
+    fn a_clean_collision_report_auto_advances_to_review() {
         let mut state = WizardState::new();
         advance_to_parameters(&mut state, "brew-coffee");
         type_str(&mut state, "n");
         state.advance();
         assert_eq!(state.step(), Step::CollisionCheck);
-        state.advance();
+
+        state.apply_collision_report(no_collision_report());
+
         assert_eq!(state.step(), Step::Review);
+        assert!(state.collision_report().is_none(), "a clean report must be discarded");
+    }
+
+    #[test]
+    fn a_degraded_collision_report_auto_advances_to_review_but_is_retained() {
+        let mut state = WizardState::new();
+        advance_to_parameters(&mut state, "brew-coffee");
+        type_str(&mut state, "n");
+        state.advance();
+
+        state.apply_collision_report(degraded_report("ollama unreachable"));
+
+        assert_eq!(state.step(), Step::Review, "a degraded check must proceed to review without a keypress");
+        assert_eq!(
+            state.collision_report().and_then(|r| r.detail.as_deref()),
+            Some("ollama unreachable"),
+            "the degrade detail must be retained so the caller can still render it"
+        );
+    }
+
+    #[test]
+    fn a_real_collision_stays_on_the_step_until_the_save_anyway_buffer_is_answered() {
+        let mut state = WizardState::new();
+        advance_to_parameters(&mut state, "brew-coffee");
+        type_str(&mut state, "n");
+        state.advance();
+
+        state.apply_collision_report(colliding_report("countdown", "count down from a number", 0.81));
+
+        assert_eq!(state.step(), Step::CollisionCheck, "a real collision must not auto-advance");
+        assert!(state.collision_report().is_some());
+    }
+
+    #[test]
+    fn confirming_the_save_anyway_prompt_clears_the_report_and_reaches_review() {
+        let mut state = WizardState::new();
+        advance_to_parameters(&mut state, "brew-coffee");
+        type_str(&mut state, "n");
+        state.advance();
+        state.apply_collision_report(colliding_report("countdown", "count down from a number", 0.81));
+
+        type_str(&mut state, "y");
+        state.advance();
+
+        assert_eq!(state.step(), Step::Review);
+        assert!(state.collision_report().is_none(), "an overridden collision must be cleared, not re-shown at review");
+    }
+
+    #[test]
+    fn declining_the_save_anyway_prompt_returns_to_intent_and_clears_the_report() {
+        let mut state = WizardState::new();
+        advance_to_parameters(&mut state, "brew-coffee");
+        type_str(&mut state, "n");
+        state.advance();
+        state.apply_collision_report(colliding_report("countdown", "count down from a number", 0.81));
+
+        type_str(&mut state, "n");
+        state.advance();
+
+        assert_eq!(state.step(), Step::Intent, "declining must return to the intent step to revise the wording");
+        assert!(state.collision_report().is_none());
+    }
+
+    #[test]
+    fn a_blank_save_anyway_answer_declines_by_default() {
+        let mut state = WizardState::new();
+        advance_to_parameters(&mut state, "brew-coffee");
+        type_str(&mut state, "n");
+        state.advance();
+        state.apply_collision_report(colliding_report("countdown", "count down from a number", 0.81));
+
+        state.advance(); // blank buffer -- default is decline (D-04)
+
+        assert_eq!(state.step(), Step::Intent, "a blank answer must decline (fail-closed default)");
+    }
+
+    #[test]
+    fn success_path_and_server_error_are_independent_terminal_fields() {
+        let mut state = WizardState::new();
+        assert!(state.success_path().is_none());
+        assert!(state.server_error().is_none());
+
+        state.set_success("/workflows/brew-coffee.md".to_string());
+        assert_eq!(state.success_path(), Some("/workflows/brew-coffee.md"));
+    }
+
+    #[test]
+    fn server_error_resets_to_the_id_step_and_clears_the_buffer_and_field_error() {
+        let mut state = WizardState::new();
+        advance_through_id_and_display_name(&mut state, "brew-coffee");
+        type_str(&mut state, "some-typed-text");
+
+        state.set_server_error("workflow 'brew-coffee' already exists".to_string());
+
+        assert_eq!(state.step(), Step::Id);
+        assert_eq!(state.buffer(), "");
+        assert!(state.field_error().is_none());
+        assert_eq!(state.server_error(), Some("workflow 'brew-coffee' already exists"));
+    }
+
+    #[test]
+    fn advancing_past_the_id_step_again_clears_a_prior_server_error() {
+        let mut state = WizardState::new();
+        state.set_server_error("workflow 'brew-coffee' already exists".to_string());
+        assert_eq!(state.step(), Step::Id);
+
+        type_str(&mut state, "brew-coffee-2");
+        state.advance();
+
+        assert!(state.server_error().is_none(), "a fresh, valid id must clear the stale server error");
     }
 
     #[test]
