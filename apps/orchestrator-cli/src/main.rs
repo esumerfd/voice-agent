@@ -11,6 +11,7 @@
 
 mod cli;
 mod create;
+mod create_wizard;
 mod delete;
 mod list;
 mod log;
