@@ -13,9 +13,9 @@ pub use activity::{ActivityEvent, ActivityLogEvent, ActivityPhase, ActivityStatu
 pub use capability::{filter_activity_event_for, filter_output_for, CAPABILITY_SPEECH, GATED_CAPABILITY_FIELDS};
 pub use client::{
     AgentConfig, CreateWorkflowRequest, CreateWorkflowResponse, DeleteWorkflowRequest,
-    DeleteWorkflowResponse, DescribeWorkflowRequest, DescribeWorkflowResponse, InvokeStatus,
-    InvokeWorkflowRequest, InvokeWorkflowResponse, ListWorkflowsRequest, ListWorkflowsResponse,
-    OrchestratorClient, ParameterDescriptor, ParameterType, WorkflowCreator, WorkflowDeleter,
-    WorkflowSummary, WorkflowWriteMode,
+    DeleteWorkflowResponse, DescribeWorkflowRequest, DescribeWorkflowResponse, IntentCollisionChecker,
+    IntentCollisionReport, InvokeStatus, InvokeWorkflowRequest, InvokeWorkflowResponse,
+    ListWorkflowsRequest, ListWorkflowsResponse, OrchestratorClient, ParameterDescriptor,
+    ParameterType, WorkflowCreator, WorkflowDeleter, WorkflowSummary, WorkflowWriteMode,
 };
 pub use envelope::{Envelope, ProtocolFrame, RequestPayload, ResponsePayload, DEFAULT_PORT};

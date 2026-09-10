@@ -91,9 +91,9 @@ use crate::client::InProcessOrchestrator;
 use crate::definition::ServiceMode;
 use crate::error::ServerError;
 use shared::{
-    filter_activity_event_for, filter_output_for, ActivityPhase, Envelope, InvokeStatus,
-    InvokeWorkflowResponse, OrchestratorClient, ProtocolFrame, RequestPayload, ResponsePayload,
-    WorkflowCreator, WorkflowDeleter,
+    filter_activity_event_for, filter_output_for, ActivityPhase, Envelope, IntentCollisionChecker,
+    InvokeStatus, InvokeWorkflowResponse, OrchestratorClient, ProtocolFrame, RequestPayload,
+    ResponsePayload, WorkflowCreator, WorkflowDeleter,
 };
 
 /// The write half of one accepted WS connection, shared (via `Arc<Mutex<..>>`)
@@ -720,6 +720,16 @@ async fn handle_protocol_frame(
             .to_string();
             send_error_res(write, id, detail).await;
         }
+        ProtocolFrame::CheckIntentCollision { intent } => {
+            handle_check_intent_collision(id, intent, orchestrator, write).await;
+        }
+        ProtocolFrame::IntentCollisionResult { .. } => {
+            let detail = ServerError::UnexpectedFrameType {
+                got: "protocol:intent_collision_result".to_string(),
+            }
+            .to_string();
+            send_error_res(write, id, detail).await;
+        }
     }
 }
 
@@ -748,6 +758,36 @@ async fn handle_route_utterance(
             confirm_tier,
             extracted_params: outcome.extracted_params,
             detail: outcome.detail,
+        },
+    )
+    .await;
+}
+
+/// Answers `ProtocolFrame::CheckIntentCollision` (Phase 10 plan 10-02,
+/// D-03/D-04). The ONLY call this function makes is
+/// `orchestrator.check_intent_collision(..)` -- a read-only classification
+/// that never dispatches, invokes, mints a run id, or mutates registry
+/// state, exactly like `handle_route_utterance` above. Extracted as its own
+/// named, region-scoped function for the SAME stated reason
+/// `handle_route_utterance` was: so this read-only guarantee is greppable in
+/// isolation and provable by a region-scoped source guard, rather than
+/// merely asserted in a comment.
+async fn handle_check_intent_collision(
+    id: u64,
+    intent: String,
+    orchestrator: &Arc<InProcessOrchestrator>,
+    write: &Arc<Mutex<WsWrite>>,
+) {
+    let report = orchestrator.check_intent_collision(&intent).await;
+    send_protocol(
+        write,
+        id,
+        ProtocolFrame::IntentCollisionResult {
+            intent,
+            colliding_workflow_id: report.colliding_workflow_id,
+            colliding_intent: report.colliding_intent,
+            similarity_score: report.similarity_score,
+            detail: report.detail,
         },
     )
     .await;

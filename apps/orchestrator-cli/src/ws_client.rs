@@ -28,10 +28,10 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 use shared::{
     CreateWorkflowRequest, CreateWorkflowResponse, DeleteWorkflowRequest, DeleteWorkflowResponse,
-    DescribeWorkflowRequest, DescribeWorkflowResponse, Envelope, InvokeStatus,
-    InvokeWorkflowRequest, InvokeWorkflowResponse, ListWorkflowsRequest, ListWorkflowsResponse,
-    OrchestratorClient, ProtocolFrame, RequestPayload, ResponsePayload, WorkflowCreator,
-    WorkflowDeleter,
+    DescribeWorkflowRequest, DescribeWorkflowResponse, Envelope, IntentCollisionChecker,
+    IntentCollisionReport, InvokeStatus, InvokeWorkflowRequest, InvokeWorkflowResponse,
+    ListWorkflowsRequest, ListWorkflowsResponse, OrchestratorClient, ProtocolFrame, RequestPayload,
+    ResponsePayload, WorkflowCreator, WorkflowDeleter,
 };
 
 /// The write half of the one WS connection this client owns.
@@ -129,7 +129,9 @@ impl WsOrchestratorClient {
                     // first request. `DescribeRun`/`RouteUtterance` are
                     // client-to-daemon only and never arrive here at all.
                     Envelope::Protocol { id, frame } => match frame {
-                        ProtocolFrame::RouteResult { .. } | ProtocolFrame::RunDescription { .. } => {
+                        ProtocolFrame::RouteResult { .. }
+                        | ProtocolFrame::RunDescription { .. }
+                        | ProtocolFrame::IntentCollisionResult { .. } => {
                             let sender = {
                                 let mut guard = loop_pending_protocol
                                     .lock()
@@ -140,10 +142,14 @@ impl WsOrchestratorClient {
                                 let _ = sender.send(frame); // caller may have given up already -- a handled no-op
                             }
                         }
-                        ProtocolFrame::Welcome { .. } | ProtocolFrame::DescribeRun { .. } | ProtocolFrame::RouteUtterance { .. } => {
+                        ProtocolFrame::Welcome { .. }
+                        | ProtocolFrame::DescribeRun { .. }
+                        | ProtocolFrame::RouteUtterance { .. }
+                        | ProtocolFrame::CheckIntentCollision { .. } => {
                             // Server-push-only (Welcome) or client-to-daemon-only
-                            // (DescribeRun/RouteUtterance) -- never resolves a
-                            // pending call. Ignored defensively (T-04-07).
+                            // (DescribeRun/RouteUtterance/CheckIntentCollision) --
+                            // never resolves a pending call. Ignored defensively
+                            // (T-04-07).
                         }
                     },
                 }
@@ -328,6 +334,44 @@ impl WorkflowDeleter for WsOrchestratorClient {
                 error: Some(format!(
                     "unexpected response payload from orchestratord: {other:?}"
                 )),
+            },
+        }
+    }
+}
+
+/// `WsOrchestratorClient`'s `IntentCollisionChecker` implementation (Phase
+/// 10 plan 10-02, D-03/D-04): wraps `call_protocol` exactly like the
+/// existing 09-03 `route` CLI trial surface does. An unexpected reply
+/// variant and a transport `Err` alike map into a report with all three
+/// collision fields `None` and the failure text in `detail` -- never a
+/// panic, matching this file's established `failure_payload` discipline.
+#[async_trait]
+impl IntentCollisionChecker for WsOrchestratorClient {
+    async fn check_intent_collision(&self, intent: &str) -> IntentCollisionReport {
+        match self.call_protocol(ProtocolFrame::CheckIntentCollision { intent: intent.to_string() }).await {
+            Ok(ProtocolFrame::IntentCollisionResult {
+                colliding_workflow_id,
+                colliding_intent,
+                similarity_score,
+                detail,
+                ..
+            }) => IntentCollisionReport {
+                colliding_workflow_id,
+                colliding_intent,
+                similarity_score,
+                detail,
+            },
+            Ok(other) => IntentCollisionReport {
+                colliding_workflow_id: None,
+                colliding_intent: None,
+                similarity_score: None,
+                detail: Some(format!("unexpected response frame from orchestratord: {other:?}")),
+            },
+            Err(err) => IntentCollisionReport {
+                colliding_workflow_id: None,
+                colliding_intent: None,
+                similarity_score: None,
+                detail: Some(err),
             },
         }
     }

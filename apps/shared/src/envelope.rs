@@ -164,6 +164,30 @@ pub enum ProtocolFrame {
         extracted_params: Option<serde_json::Value>,
         detail: Option<String>,
     },
+    /// Plan 10-02 (D-03/D-04): client-to-daemon only, the guided-creation
+    /// wizard's save-time semantic-collision check. Sending this frame NEVER
+    /// starts a run, mints a run id, or spends anything -- like
+    /// `RouteUtterance`, it is a read-only classification, not a routing
+    /// turn. `ProtocolFrame` is internally tagged (`#[serde(tag = "kind")]`),
+    /// so unlike `RequestPayload` this variant introduces no ordering hazard
+    /// and needs no placement reasoning.
+    CheckIntentCollision { intent: String },
+    /// The daemon's reply to `CheckIntentCollision` (D-03/D-04): a normal
+    /// reply, never an error and never a dropped connection, even when the
+    /// check itself could not be performed. `detail` carries the degrade
+    /// reason (router not configured, Ollama unreachable) as a NORMAL reply
+    /// rather than an error -- an inability to check is not itself a
+    /// collision. `colliding_workflow_id`/`colliding_intent`/
+    /// `similarity_score` are all `Some` together (a detected collision) or
+    /// all `None` together (no collision, OR the check degraded and
+    /// `detail` explains why).
+    IntentCollisionResult {
+        intent: String,
+        colliding_workflow_id: Option<String>,
+        colliding_intent: Option<String>,
+        similarity_score: Option<f32>,
+        detail: Option<String>,
+    },
 }
 
 /// The payload of an `Envelope::Req`. `#[serde(untagged)]` wraps the
@@ -1116,6 +1140,102 @@ mod tests {
         assert!(value["frame"]["confirm_tier"].is_null());
         assert!(value["frame"]["extracted_params"].is_null());
         assert_eq!(value["frame"]["detail"], json!("no candidate workflow matched"));
+    }
+
+    // ---- Plan 10-02 (D-03/D-04): CheckIntentCollision / IntentCollisionResult ----
+
+    #[test]
+    fn protocol_check_intent_collision_round_trips_and_carries_the_literal_tags() {
+        let envelope = Envelope::Protocol {
+            id: 10,
+            frame: ProtocolFrame::CheckIntentCollision {
+                intent: "brew a fresh pot of coffee".to_string(),
+            },
+        };
+        assert_round_trips(&envelope);
+
+        let value = serde_json::to_value(&envelope).expect("serialize");
+        assert_eq!(value["type"], json!("protocol"), "expected type == \"protocol\", got: {value}");
+        assert_eq!(
+            value["frame"]["kind"],
+            json!("check_intent_collision"),
+            "expected frame.kind == \"check_intent_collision\", got: {value}"
+        );
+        assert_eq!(
+            value["frame"]["intent"],
+            json!("brew a fresh pot of coffee"),
+            "expected the wrapped intent to survive, got: {value}"
+        );
+    }
+
+    #[test]
+    fn protocol_intent_collision_result_round_trips_with_a_detected_collision() {
+        let envelope = Envelope::Protocol {
+            id: 11,
+            frame: ProtocolFrame::IntentCollisionResult {
+                intent: "brew a fresh pot of coffee".to_string(),
+                colliding_workflow_id: Some("make_coffee".to_string()),
+                colliding_intent: Some("make a pot of coffee".to_string()),
+                similarity_score: Some(0.91),
+                detail: None,
+            },
+        };
+        assert_round_trips(&envelope);
+
+        let value = serde_json::to_value(&envelope).expect("serialize");
+        assert_eq!(
+            value["frame"]["kind"],
+            json!("intent_collision_result"),
+            "expected frame.kind == \"intent_collision_result\", got: {value}"
+        );
+        assert_eq!(value["frame"]["colliding_workflow_id"], json!("make_coffee"));
+        assert_eq!(value["frame"]["colliding_intent"], json!("make a pot of coffee"));
+        assert_eq!(value["frame"]["similarity_score"].as_f64().map(|v| v as f32), Some(0.91_f32));
+    }
+
+    /// No-collision / degraded-check shape: every collision field absent,
+    /// `detail` carries the degrade reason (or is itself `None` for a clean
+    /// no-collision reply).
+    #[test]
+    fn protocol_intent_collision_result_with_no_collision_round_trips() {
+        let envelope = Envelope::Protocol {
+            id: 12,
+            frame: ProtocolFrame::IntentCollisionResult {
+                intent: "an entirely novel intent".to_string(),
+                colliding_workflow_id: None,
+                colliding_intent: None,
+                similarity_score: None,
+                detail: None,
+            },
+        };
+        assert_round_trips(&envelope);
+
+        let value = serde_json::to_value(&envelope).expect("serialize");
+        assert!(value["frame"]["colliding_workflow_id"].is_null());
+        assert!(value["frame"]["colliding_intent"].is_null());
+        assert!(value["frame"]["similarity_score"].is_null());
+        assert!(value["frame"]["detail"].is_null());
+    }
+
+    #[test]
+    fn protocol_intent_collision_result_with_a_degrade_detail_round_trips() {
+        let envelope = Envelope::Protocol {
+            id: 13,
+            frame: ProtocolFrame::IntentCollisionResult {
+                intent: "an entirely novel intent".to_string(),
+                colliding_workflow_id: None,
+                colliding_intent: None,
+                similarity_score: None,
+                detail: Some("the router is not configured on this daemon".to_string()),
+            },
+        };
+        assert_round_trips(&envelope);
+
+        let value = serde_json::to_value(&envelope).expect("serialize");
+        assert_eq!(
+            value["frame"]["detail"],
+            json!("the router is not configured on this daemon")
+        );
     }
 
     /// D-05 ordering guard: the new `Envelope::Protocol` variant must never

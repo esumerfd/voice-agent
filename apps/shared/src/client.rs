@@ -255,6 +255,37 @@ pub trait WorkflowDeleter: Send + Sync {
     async fn delete_workflow(&self, req: DeleteWorkflowRequest) -> DeleteWorkflowResponse;
 }
 
+/// The reply DTO for [`IntentCollisionChecker::check_intent_collision`]
+/// (Phase 10 plan 10-02, D-03/D-04). A plain report, not a `Result` --
+/// mirrors `InProcessOrchestrator::route_utterance`'s degrade-never-propagate
+/// shape, so every transport/router failure lands in `detail` rather than a
+/// distinct error channel the caller must handle twice. A detected collision
+/// carries all three of `colliding_workflow_id`/`colliding_intent`/
+/// `similarity_score` as `Some` together; no collision (or a degraded check)
+/// carries all three as `None` together, with `detail` distinguishing "no
+/// collision, checked cleanly" (`None`) from "could not check" (`Some`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IntentCollisionReport {
+    pub colliding_workflow_id: Option<String>,
+    pub colliding_intent: Option<String>,
+    pub similarity_score: Option<f32>,
+    pub detail: Option<String>,
+}
+
+/// A second, narrow trait (D-DISC-02) kept separate from `OrchestratorClient`
+/// and from `WorkflowCreator`/`WorkflowDeleter`, following their own
+/// documented precedent: a client that never authors workflows through the
+/// guided wizard (e.g. a future read-only client) is not forced to grow an
+/// unused method. This trait -- never the concrete client type -- is what
+/// `create_wizard` takes, keeping `orchestrator-cli`'s `#[path]`
+/// test-inclusion trick compiling (D-DISC-02). Implemented by
+/// `InProcessOrchestrator` (daemon side) and `WsOrchestratorClient` (CLI
+/// side).
+#[async_trait]
+pub trait IntentCollisionChecker: Send + Sync {
+    async fn check_intent_collision(&self, intent: &str) -> IntentCollisionReport;
+}
+
 /// The stable seam every consumer calls into the orchestrator through
 /// (D-04). Kept `#[async_trait]` for dyn dispatch even with a single M1
 /// implementation — explicit future-proofing toward the transport swap,

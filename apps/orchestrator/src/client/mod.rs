@@ -21,9 +21,9 @@ use crate::router::{RouteOutcome, Router};
 use crate::service::{RunStatus, Service};
 use shared::{
     CreateWorkflowRequest, CreateWorkflowResponse, DeleteWorkflowRequest, DeleteWorkflowResponse,
-    DescribeWorkflowRequest, DescribeWorkflowResponse, InvokeStatus, InvokeWorkflowRequest,
-    InvokeWorkflowResponse, ListWorkflowsRequest, ListWorkflowsResponse, OrchestratorClient,
-    ParameterDescriptor, WorkflowCreator, WorkflowDeleter,
+    DescribeWorkflowRequest, DescribeWorkflowResponse, IntentCollisionChecker, IntentCollisionReport,
+    InvokeStatus, InvokeWorkflowRequest, InvokeWorkflowResponse, ListWorkflowsRequest,
+    ListWorkflowsResponse, OrchestratorClient, ParameterDescriptor, WorkflowCreator, WorkflowDeleter,
 };
 
 impl From<RunStatus> for InvokeStatus {
@@ -308,6 +308,57 @@ impl WorkflowDeleter for InProcessOrchestrator {
                 workflow_path: None,
                 script_path: None,
                 error: Some(err.to_string()),
+            },
+        }
+    }
+}
+
+/// `InProcessOrchestrator`'s `IntentCollisionChecker` implementation (Phase
+/// 10 plan 10-02, D-03/D-04): modeled line-for-line on `route_utterance`
+/// above. `None` router degrades to a report whose `detail` names the
+/// missing router configuration -- never a dropped connection, never a
+/// `ServerError`. Otherwise loads the registry with the same per-request
+/// `Registry::load(&self.workflows_dir)` call every other accessor here
+/// already uses, calls `Router::check_intent_collision`, and maps both the
+/// `Err` arm and the `Ok(None)` arm into the report shape: a `RouterError`
+/// degrades to a report carrying `detail` (an inability to check is not
+/// itself a collision, D-04), and `Ok(None)` degrades to a clean
+/// no-collision report with `detail: None`.
+#[async_trait]
+impl IntentCollisionChecker for InProcessOrchestrator {
+    async fn check_intent_collision(&self, intent: &str) -> IntentCollisionReport {
+        let Some(router) = &self.router else {
+            return IntentCollisionReport {
+                colliding_workflow_id: None,
+                colliding_intent: None,
+                similarity_score: None,
+                detail: Some(
+                    "the router is not configured on this daemon (no --ollama-url/--embed-model \
+                     resolved at startup)"
+                        .to_string(),
+                ),
+            };
+        };
+
+        let (registry, _errors) = Registry::load(&self.workflows_dir);
+        match router.check_intent_collision(intent, &registry).await {
+            Ok(Some(collision)) => IntentCollisionReport {
+                colliding_workflow_id: Some(collision.workflow_id),
+                colliding_intent: Some(collision.intent),
+                similarity_score: Some(collision.score),
+                detail: None,
+            },
+            Ok(None) => IntentCollisionReport {
+                colliding_workflow_id: None,
+                colliding_intent: None,
+                similarity_score: None,
+                detail: None,
+            },
+            Err(err) => IntentCollisionReport {
+                colliding_workflow_id: None,
+                colliding_intent: None,
+                similarity_score: None,
+                detail: Some(err.to_string()),
             },
         }
     }
