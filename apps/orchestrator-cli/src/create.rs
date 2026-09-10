@@ -275,18 +275,14 @@ pub fn classify_as_script(content: &str, source: &str, force_script: bool, force
 
 /// Default frontmatter `name:` derivation (D-DISC-08): `my_workflow` ->
 /// `My Workflow` -- split on `_`/`-`, uppercase each initial.
+/// Delegates to `shared::wizard::derive_display_name` (Phase 10, plan
+/// 10-03: promoted so `create_wizard`'s guided flow and this flag-driven
+/// path -- and, from this plan on, `orchestrator-tui`'s wizard -- can never
+/// derive a different default from the same id). Symbol kept here, with
+/// the same signature, since `create_integration.rs` calls it directly as
+/// `create::derive_display_name`.
 pub fn derive_display_name(id: &str) -> String {
-    id.split(['_', '-'])
-        .filter(|word| !word.is_empty())
-        .map(|word| {
-            let mut chars = word.chars();
-            match chars.next() {
-                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
-                None => String::new(),
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
+    shared::wizard::derive_display_name(id)
 }
 
 fn render_success<W: Write>(out: &mut W, value: serde_json::Value) -> std::io::Result<i32> {

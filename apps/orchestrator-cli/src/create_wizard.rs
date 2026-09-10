@@ -42,6 +42,7 @@
 
 use std::io::{BufRead, Write};
 
+use shared::wizard::{self, HandlerChoice, Step};
 use shared::{
     AgentConfig, CreateWorkflowRequest, IntentCollisionChecker, ParameterDescriptor, ParameterType,
     WorkflowCreator, WorkflowWriteMode,
@@ -50,56 +51,22 @@ use shared::{
 use crate::create::{agent_config_from_flags, derive_display_name, parse_param, AgentFlags};
 
 // ---- Client-side cap mirrors (a UX affordance only; see module doc). ----
-// `orchestrator-cli` cannot import `registry::writer`'s constants directly
-// in production code (separate binary crate; `orchestrator` is only a
-// dev-dependency of this crate, used by its own test harnesses). Promoting
-// these caps into `shared` is the cleaner long-term home -- out of this
-// phase's boundary (10-CONTEXT.md: no changes to the write path's
-// validation rules). `tests/create_wizard_integration.rs` asserts each of
-// these equals the real constant it mirrors, so drift is a test failure.
-
-/// Mirrors `registry::writer::MAX_WORKFLOW_ID_LEN`.
-pub const MAX_WORKFLOW_ID_LEN_MIRROR: usize = 64;
-/// Mirrors `registry::writer::MAX_WORKFLOW_NAME_LEN`.
-pub const MAX_WORKFLOW_NAME_LEN_MIRROR: usize = 200;
-/// Mirrors `registry::writer::MAX_INTENT_LEN`.
-pub const MAX_INTENT_LEN_MIRROR: usize = 1024;
-/// Mirrors `registry::writer::MAX_TRIGGERS`.
-pub const MAX_TRIGGERS_MIRROR: usize = 32;
-/// Mirrors `registry::writer::MAX_AGENT_FILES`.
-pub const MAX_AGENT_FILES_MIRROR: usize = 50;
-/// Mirrors `registry::writer::MAX_AGENT_FILE_LEN`.
-pub const MAX_AGENT_FILE_LEN_MIRROR: usize = 512;
-
-/// The fixed trigger checklist (D-06) -- never free text.
-pub const TRIGGER_CHOICES: &[&str] = &["cli", "voice"];
-
-/// Handler-type selection (D-05, Step 6) -- an exhaustive enum so the
-/// branch deriving the request's script/agent/description triple cannot
-/// silently miss a shape, mirroring how `create::run` derives the same
-/// triple from its own classification.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HandlerChoice {
-    ScriptAction,
-    MarkdownAction,
-    Agent,
-}
-
-/// A rejected answer's field name and the daemon's own reason wording
-/// (mirroring `registry::writer`'s reason strings verbatim where
-/// applicable), rendered via `line()` as `[ERROR] {field} {reason}.` --
-/// UI-SPEC's generic validation-error shape.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WizardError {
-    pub field: &'static str,
-    pub reason: String,
-}
-
-impl WizardError {
-    fn line(&self) -> String {
-        format!("[ERROR] {} {}.", self.field, self.reason)
-    }
-}
+// Phase 10 plan 10-03 promoted these (and the step order/copy/validators
+// below) into `shared::wizard` so `orchestrator-tui`'s wizard can never
+// drift from this wording -- re-exported here under their original names
+// so `tests/create_wizard_integration.rs`'s existing
+// `create_wizard::MAX_*_MIRROR` assertions keep passing unmodified. Some of
+// these (id/name/intent/agent-file-length) are no longer read by this
+// file's own production code -- validation now calls straight into
+// `shared::wizard` -- so they are read only by that `#[path]`-included test
+// module, never by the `orchestrator` binary itself (this crate has no
+// `[lib]` target, so `pub` does not make an item externally visible the
+// way it would in a library crate).
+#[allow(unused_imports)]
+pub use shared::wizard::{
+    MAX_AGENT_FILES_MIRROR, MAX_AGENT_FILE_LEN_MIRROR, MAX_INTENT_LEN_MIRROR, MAX_TRIGGERS_MIRROR,
+    MAX_WORKFLOW_ID_LEN_MIRROR, MAX_WORKFLOW_NAME_LEN_MIRROR,
+};
 
 /// The collected, validated field set (built up incrementally over the
 /// nine steps). Only converted into a `CreateWorkflowRequest` at Step 9's
@@ -116,99 +83,6 @@ pub struct WizardAnswers {
     pub timeout_secs: Option<u64>,
     pub max_budget_usd: Option<f64>,
     pub parameters: Vec<ParameterDescriptor>,
-}
-
-/// Verbatim mirror of `registry::writer::validate_id` (writer.rs lines
-/// 359-392): non-empty, at most `MAX_WORKFLOW_ID_LEN_MIRROR` characters,
-/// every character in `[a-z0-9_-]`, first character alphanumeric. Reason
-/// strings match the daemon's own character for character (UI-SPEC Step 1)
-/// so `[ERROR] id {reason}.` renders identically whether caught here or
-/// returned by the daemon.
-pub fn validate_id_client(id: &str) -> Result<(), WizardError> {
-    if id.is_empty() {
-        return Err(WizardError {
-            field: "id",
-            reason: "must not be empty".to_string(),
-        });
-    }
-    if id.chars().count() > MAX_WORKFLOW_ID_LEN_MIRROR {
-        return Err(WizardError {
-            field: "id",
-            reason: format!("must be at most {MAX_WORKFLOW_ID_LEN_MIRROR} characters"),
-        });
-    }
-    if !id.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-') {
-        return Err(WizardError {
-            field: "id",
-            reason: "must contain only lowercase letters, digits, `_`, and `-`".to_string(),
-        });
-    }
-    let first = id.chars().next().expect("id is non-empty, checked above");
-    if !first.is_ascii_alphanumeric() {
-        return Err(WizardError {
-            field: "id",
-            reason: "must start with an alphanumeric character".to_string(),
-        });
-    }
-    Ok(())
-}
-
-/// Client-side mirror of the daemon's display-name length enforcement
-/// (UI-SPEC Step 2): optional -- a blank answer is valid and handled by the
-/// caller before this is ever invoked -- but a GIVEN name must be at most
-/// `MAX_WORKFLOW_NAME_LEN_MIRROR` Unicode code points.
-fn validate_display_name_client(name: &str) -> Result<(), WizardError> {
-    if name.chars().count() > MAX_WORKFLOW_NAME_LEN_MIRROR {
-        return Err(WizardError {
-            field: "name",
-            reason: format!("must be at most {MAX_WORKFLOW_NAME_LEN_MIRROR} characters"),
-        });
-    }
-    Ok(())
-}
-
-/// Client-side mirror of the daemon's intent-length enforcement (UI-SPEC
-/// Step 5): required, non-empty after trim, at most
-/// `MAX_INTENT_LEN_MIRROR` Unicode code points.
-fn validate_intent_client(intent: &str) -> Result<(), WizardError> {
-    if intent.trim().is_empty() {
-        return Err(WizardError {
-            field: "intent",
-            reason: "must not be empty".to_string(),
-        });
-    }
-    if intent.chars().count() > MAX_INTENT_LEN_MIRROR {
-        return Err(WizardError {
-            field: "intent",
-            reason: format!("must be at most {MAX_INTENT_LEN_MIRROR} characters"),
-        });
-    }
-    Ok(())
-}
-
-/// Client-side mirror of the daemon's per-entry agent-file validation
-/// (UI-SPEC Step 6a): non-empty, no NUL byte, at most
-/// `MAX_AGENT_FILE_LEN_MIRROR` Unicode code points.
-fn validate_agent_file_client(entry: &str) -> Result<(), WizardError> {
-    if entry.is_empty() {
-        return Err(WizardError {
-            field: "agent file",
-            reason: "must not be empty".to_string(),
-        });
-    }
-    if entry.contains('\0') {
-        return Err(WizardError {
-            field: "agent file",
-            reason: "must not contain a NUL byte".to_string(),
-        });
-    }
-    if entry.chars().count() > MAX_AGENT_FILE_LEN_MIRROR {
-        return Err(WizardError {
-            field: "agent file",
-            reason: format!("must be at most {MAX_AGENT_FILE_LEN_MIRROR} characters"),
-        });
-    }
-    Ok(())
 }
 
 /// Runs the guided `workflow create` Q&A flow end to end. Returns the
@@ -228,7 +102,7 @@ pub async fn run<R: BufRead, W: Write>(
         return Ok(1);
     };
 
-    let Some(description) = prompt_line(input, out, "Description (workflow body text):")? else {
+    let Some(description) = prompt_line(input, out, &wizard::prompt_for(Step::Description, ""))? else {
         return Ok(1);
     };
 
@@ -248,10 +122,10 @@ pub async fn run<R: BufRead, W: Write>(
         let Some(files) = prompt_agent_files(input, out)? else {
             return Ok(1);
         };
-        let Some(timeout_secs) = prompt_optional_u64(input, out, "Timeout in seconds [default: daemon default]:")? else {
+        let Some(timeout_secs) = prompt_optional_u64(input, out, &wizard::prompt_for(Step::AgentTimeout, ""))? else {
             return Ok(1);
         };
-        let Some(max_budget_usd) = prompt_optional_f64(input, out, "Max budget in USD [default: daemon default]:")? else {
+        let Some(max_budget_usd) = prompt_optional_f64(input, out, &wizard::prompt_for(Step::AgentBudget, ""))? else {
             return Ok(1);
         };
         (files, timeout_secs, max_budget_usd)
@@ -367,7 +241,7 @@ async fn run_collision_check<R: BufRead, W: Write>(
     answers: &mut WizardAnswers,
 ) -> std::io::Result<Option<()>> {
     loop {
-        writeln!(out, "Checking for similar existing workflows...")?;
+        writeln!(out, "{}", wizard::prompt_for(Step::CollisionCheck, ""))?;
         let report = checker.check_intent_collision(&answers.intent).await;
 
         match (report.colliding_workflow_id, report.colliding_intent, report.similarity_score) {
@@ -464,57 +338,52 @@ fn build_agent_config(
     agent_config_from_flags(&flags).expect("AgentFlags{agent: true, ..} never returns Err")
 }
 
-/// Step 1: loops on `validate_id_client` until a valid id is entered.
-/// Client-side rejection never reaches `WorkflowCreator` -- only a fully
-/// valid id is ever returned.
+/// Step 1: loops on `shared::wizard::validate_id` until a valid id is
+/// entered. Client-side rejection never reaches `WorkflowCreator` -- only a
+/// fully valid id is ever returned.
 fn prompt_id<R: BufRead, W: Write>(input: &mut R, out: &mut W) -> std::io::Result<Option<String>> {
     loop {
-        let Some(raw) = prompt_line(input, out, "Workflow id (used as the .md filename):")? else {
+        let Some(raw) = prompt_line(input, out, &wizard::prompt_for(Step::Id, ""))? else {
             return Ok(None);
         };
         let id = raw.trim().to_string();
-        match validate_id_client(&id) {
+        match wizard::validate_id(&id) {
             Ok(()) => return Ok(Some(id)),
             Err(err) => writeln!(out, "{}", err.line())?,
         }
     }
 }
 
-/// Step 2: optional -- a blank answer accepts the `derive_display_name(id)`
-/// default (`None`, resolved by the caller at request-build time so a
-/// server-side id change on re-prompt still derives from the CURRENT id).
-/// A given name loops on `validate_display_name_client` until valid.
+/// Step 2: optional -- a blank answer accepts the
+/// `shared::wizard::derive_display_name(id)` default (`None`, resolved by
+/// the caller at request-build time so a server-side id change on
+/// re-prompt still derives from the CURRENT id). A given name loops on
+/// `shared::wizard::validate_display_name` until valid.
 fn prompt_display_name<R: BufRead, W: Write>(input: &mut R, out: &mut W, id: &str) -> std::io::Result<Option<Option<String>>> {
-    let default_name = derive_display_name(id);
     loop {
-        let Some(raw) = prompt_line(input, out, &format!("Display name [default: {default_name}]:"))? else {
+        let Some(raw) = prompt_line(input, out, &wizard::prompt_for(Step::DisplayName, id))? else {
             return Ok(None);
         };
         let trimmed = raw.trim();
         if trimmed.is_empty() {
             return Ok(Some(None));
         }
-        match validate_display_name_client(trimmed) {
+        match wizard::validate_display_name(trimmed) {
             Ok(()) => return Ok(Some(Some(trimmed.to_string()))),
             Err(err) => writeln!(out, "{}", err.line())?,
         }
     }
 }
 
-/// Step 5: loops on `validate_intent_client` until a valid intent is
-/// entered.
+/// Step 5: loops on `shared::wizard::validate_intent` until a valid intent
+/// is entered.
 fn prompt_intent<R: BufRead, W: Write>(input: &mut R, out: &mut W) -> std::io::Result<Option<String>> {
     loop {
-        let Some(raw) = prompt_line(
-            input,
-            out,
-            "Intent phrase (a sentence describing when this should fire, used for voice/utterance routing):",
-        )?
-        else {
+        let Some(raw) = prompt_line(input, out, &wizard::prompt_for(Step::Intent, ""))? else {
             return Ok(None);
         };
         let intent = raw.trim().to_string();
-        match validate_intent_client(&intent) {
+        match wizard::validate_intent(&intent) {
             Ok(()) => return Ok(Some(intent)),
             Err(err) => writeln!(out, "{}", err.line())?,
         }
@@ -525,17 +394,17 @@ fn prompt_intent<R: BufRead, W: Write>(input: &mut R, out: &mut W) -> std::io::R
 /// valid selection is made; free-text tokens that are not a listed number
 /// are silently rejected rather than passed through as a trigger name.
 fn prompt_triggers<R: BufRead, W: Write>(input: &mut R, out: &mut W) -> std::io::Result<Option<Vec<String>>> {
-    writeln!(out, "Select trigger types (at least one):")?;
-    for (index, choice) in TRIGGER_CHOICES.iter().enumerate() {
-        writeln!(out, "  {}) {}", index + 1, choice)?;
+    writeln!(out, "{}", wizard::prompt_for(Step::Triggers, ""))?;
+    for line in wizard::menu_lines_for(Step::Triggers) {
+        writeln!(out, "{line}")?;
     }
     loop {
         let Some(raw) = read_line(input)? else {
             return Ok(None);
         };
         let selected = parse_trigger_selection(&raw);
-        if selected.is_empty() {
-            writeln!(out, "Select at least one trigger type.")?;
+        if wizard::validate_triggers(&selected).is_err() {
+            writeln!(out, "{}", wizard::TRIGGERS_EMPTY_LINE)?;
             continue;
         }
         return Ok(Some(selected));
@@ -560,7 +429,7 @@ fn parse_trigger_selection(raw: &str) -> Vec<String> {
         let Some(index) = number.checked_sub(1) else {
             continue;
         };
-        let Some(choice) = TRIGGER_CHOICES.get(index) else {
+        let Some(choice) = wizard::TRIGGER_CHOICES.get(index) else {
             continue;
         };
         // Client-side mirror of the daemon's MAX_TRIGGERS cap. Unreachable
@@ -580,10 +449,10 @@ fn parse_trigger_selection(raw: &str) -> Vec<String> {
 /// Step 6: the fixed three-item handler menu (D-05). Loops until one of
 /// `1`/`2`/`3` is entered.
 fn prompt_handler<R: BufRead, W: Write>(input: &mut R, out: &mut W) -> std::io::Result<Option<HandlerChoice>> {
-    writeln!(out, "Select handler type:")?;
-    writeln!(out, "  1) Script-backed action — runs a script or command you provide")?;
-    writeln!(out, "  2) Markdown-body action — description text becomes the action body, no script")?;
-    writeln!(out, "  3) Agent (Claude-backed) — runs a Claude Code prompt")?;
+    writeln!(out, "{}", wizard::prompt_for(Step::HandlerType, ""))?;
+    for line in wizard::menu_lines_for(Step::HandlerType) {
+        writeln!(out, "{line}")?;
+    }
     loop {
         let Some(raw) = read_line(input)? else {
             return Ok(None);
@@ -599,10 +468,10 @@ fn prompt_handler<R: BufRead, W: Write>(input: &mut R, out: &mut W) -> std::io::
 
 /// Step 6a (Agent only): repeatable reference-file entries, a blank line
 /// finishes the list. Each entry is validated client-side
-/// (`validate_agent_file_client`); a rejected entry is reported and the
-/// prompt loops again without being added.
+/// (`shared::wizard::validate_agent_file`); a rejected entry is reported
+/// and the prompt loops again without being added.
 fn prompt_agent_files<R: BufRead, W: Write>(input: &mut R, out: &mut W) -> std::io::Result<Option<Vec<String>>> {
-    writeln!(out, "Reference files (repeatable, blank line to finish):")?;
+    writeln!(out, "{}", wizard::prompt_for(Step::AgentFiles, ""))?;
     let mut files = Vec::new();
     loop {
         let Some(raw) = read_line(input)? else {
@@ -615,7 +484,7 @@ fn prompt_agent_files<R: BufRead, W: Write>(input: &mut R, out: &mut W) -> std::
             writeln!(out, "[ERROR] agent files must be at most {MAX_AGENT_FILES_MIRROR} entries.")?;
             continue;
         }
-        match validate_agent_file_client(&raw) {
+        match wizard::validate_agent_file(&raw) {
             Ok(()) => files.push(raw),
             Err(err) => writeln!(out, "{}", err.line())?,
         }
@@ -675,7 +544,7 @@ fn prompt_optional_f64<R: BufRead, W: Write>(
 fn prompt_parameters<R: BufRead, W: Write>(input: &mut R, out: &mut W) -> std::io::Result<Option<Vec<ParameterDescriptor>>> {
     let mut parameters: Vec<ParameterDescriptor> = Vec::new();
     loop {
-        let Some(raw) = prompt_line(input, out, "Add a parameter? [y/N]:")? else {
+        let Some(raw) = prompt_line(input, out, &wizard::prompt_for(Step::Parameters, ""))? else {
             return Ok(None);
         };
         if !matches!(raw.trim(), "y" | "Y") {
@@ -702,7 +571,7 @@ fn prompt_parameters<R: BufRead, W: Write>(input: &mut R, out: &mut W) -> std::i
         match parse_param(&spec) {
             Ok(descriptor) => {
                 if parameters.iter().any(|p| p.name == descriptor.name) {
-                    writeln!(out, "Parameter '{}' already added.", descriptor.name)?;
+                    writeln!(out, "{}", wizard::duplicate_parameter_message(&descriptor.name))?;
                 } else {
                     parameters.push(descriptor);
                 }
@@ -727,7 +596,7 @@ fn prompt_confirm<R: BufRead, W: Write>(input: &mut R, out: &mut W, prompt: &str
 /// renders the single line `Parameters: none` instead, with no
 /// singular/plural copy variation for the populated case.
 fn render_review<W: Write>(out: &mut W, answers: &WizardAnswers) -> std::io::Result<()> {
-    writeln!(out, "Review:")?;
+    writeln!(out, "{}", wizard::prompt_for(Step::Review, ""))?;
     writeln!(
         out,
         "  id: {}",
